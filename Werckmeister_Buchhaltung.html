@@ -4,9 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Verein Werckmeister — Buchhaltung</title>
-  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Versionen fixiert: unpkg liefert ohne Version inzwischen Babel 8, das die Inline-JSX-Kompilierung bricht -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: #F1F5F9; font-family: sans-serif; }
@@ -55,6 +56,7 @@ const DEFAULT_ACCOUNTS = [
   { number:"3200", name:"Veranstaltungseinnahmen",         category:"ertrag", group:"Vereinserträge"  },
   { number:"3300", name:"Subventionen / Beiträge Dritter",category:"ertrag", group:"Vereinserträge"  },
   { number:"3400", name:"Zinserträge",                     category:"ertrag", group:"Finanzerträge"   },
+  { number:"3450", name:"Kursgewinne (Fremdwährungen)",    category:"ertrag", group:"Finanzerträge"   },
   { number:"3500", name:"Sonstige Erträge",                category:"ertrag", group:"Übriges"         },
   // AUFWÄNDE
   { number:"4000", name:"Lohnaufwand",                     category:"aufwand", group:"Personalaufwand"   },
@@ -70,7 +72,12 @@ const DEFAULT_ACCOUNTS = [
   { number:"6400", name:"Abschreibungen",                  category:"aufwand", group:"Abschreibungen"     },
   { number:"6500", name:"Versicherungsaufwand",            category:"aufwand", group:"Verwaltungsaufwand" },
   { number:"6600", name:"Diverses",                        category:"aufwand", group:"Übriges"            },
+  { number:"6700", name:"Kursverluste (Fremdwährungen)",   category:"aufwand", group:"Finanzaufwand"      },
 ];
+
+// Standardkonten für Kursdifferenzen (Fremdwährungsbewertung)
+const FX_GAIN_ACCOUNT = { number:"3450", name:"Kursgewinne (Fremdwährungen)",  category:"ertrag",  group:"Finanzerträge" };
+const FX_LOSS_ACCOUNT = { number:"6700", name:"Kursverluste (Fremdwährungen)", category:"aufwand", group:"Finanzaufwand" };
 
 const STORAGE_KEY = "werckmeister_buch_v1";
 
@@ -79,6 +86,99 @@ const STORAGE_KEY = "werckmeister_buch_v1";
 // ═══════════════════════════════════════════════════════════════
 const fmt = (n) =>
   new Intl.NumberFormat("de-CH", { minimumFractionDigits:2, maximumFractionDigits:2 }).format(n||0);
+
+// ── Fremdwährungen ──────────────────────────────────────────────
+// Buchwährung ist CHF (OR 957a Abs. 4). Fremdwährungskonten (nur Aktiven/Passiven)
+// führen zusätzlich den Betrag in Originalwährung. Jede Buchung wird zum
+// Transaktionskurs in CHF umgerechnet; per Bilanzstichtag werden die Salden zum
+// Stichtagskurs bewertet (Bewertungsbuchungen ohne Fremdwährungsbetrag).
+const CHF = "CHF";
+const COMMON_CURRENCIES = ["EUR","USD","GBP","JPY","SEK","NOK","DKK","CAD","AUD","CNY","PLN","CZK","HUF"];
+
+const fmtRate = (n) =>
+  new Intl.NumberFormat("de-CH", { minimumFractionDigits:4, maximumFractionDigits:6 }).format(n||0);
+const parseNum = (v) => {
+  if(v===null||v===undefined||v==="") return NaN;
+  return parseFloat(String(v).replace(/['’\s]/g,"").replace(",","."));
+};
+const round2 = (n) => Math.round((n+Number.EPSILON)*100)/100;
+const accCurrency = (accounts, num) => accounts.find(a=>a.number===num)?.currency || CHF;
+
+// Fremdwährung einer Buchung ermitteln (currency:null = reine CHF-Buchung)
+const entryFxCurrency = (accounts, debit, credit) => {
+  const cd = accCurrency(accounts,debit), cc = accCurrency(accounts,credit);
+  if(cd!==CHF && cc!==CHF && cd!==cc)
+    return { error:`Soll (${cd}) und Haben (${cc}) haben verschiedene Fremdwährungen – `+
+                   `bitte in zwei Buchungen über ein CHF-Konto erfassen.` };
+  return { currency: cd!==CHF ? cd : (cc!==CHF ? cc : null) };
+};
+
+// Formular-Update mit gegenseitiger Neuberechnung von CHF-Betrag und Kurs
+const fxFormUpdate = (prev, k, v) => {
+  const next = { ...prev, [k]:v };
+  const fx = parseNum(next.fxAmount), rate = parseNum(next.fxRate), amt = parseNum(next.amount);
+  if((k==="fxAmount"||k==="fxRate") && fx>0 && rate>0) next.amount = round2(fx*rate).toFixed(2);
+  if(k==="amount" && fx>0 && amt>0) next.fxRate = String(+(amt/fx).toFixed(6));
+  return next;
+};
+
+// Buchung validieren und normalisieren → { entry } oder { error }
+const normalizeEntry = (raw, accounts) => {
+  if(!raw.date||!raw.description||!raw.debit||!raw.credit||raw.amount===""||raw.amount==null)
+    return { error:"Pflichtfelder: Datum, Text, Soll, Haben, Betrag." };
+  if(raw.debit===raw.credit) return { error:"Soll ≠ Haben." };
+  const amt = round2(parseNum(raw.amount));
+  if(isNaN(amt)||amt<=0) return { error:"Betrag CHF muss > 0 sein." };
+  const { currency, error } = entryFxCurrency(accounts, raw.debit, raw.credit);
+  if(error) return { error };
+  const base = { id:raw.id, date:raw.date, description:raw.description, reference:raw.reference||"",
+                 debit:raw.debit, credit:raw.credit, amount:amt };
+  if(!currency) return { entry:base };
+  if(raw.fxReval) return { entry:{ ...base, fxCurrency:currency, fxAmount:0, fxReval:true } };
+  const fx = round2(parseNum(raw.fxAmount));
+  if(isNaN(fx)||fx<=0)
+    return { error:`Betrag ${currency} muss > 0 sein (oder Buchung als Kursdifferenz markieren).` };
+  return { entry:{ ...base, fxCurrency:currency, fxAmount:fx, fxRate:+(amt/fx).toFixed(6) } };
+};
+
+// Stichtagsbewertung aller Fremdwährungskonten
+//  – Verluste werden immer gebucht (Vorsichtsprinzip, OR 960 Abs. 2)
+//  – Gewinne standardmässig nur auf flüssigen Mitteln / kurzfristigen Wertschriften
+//    (Konten 10xx, beobachtbarer Marktpreis OR 960b); auf Forderungen und
+//    Verbindlichkeiten bleiben unrealisierte Gewinne unberücksichtigt (Imparitätsprinzip)
+const computeFxValuation = ({ accounts, getSaldo, getFxSaldo, rates, year }) =>
+  accounts
+    .filter(a=>(a.currency||CHF)!==CHF && (a.category==="aktiven"||a.category==="passiven"))
+    .slice().sort((a,b)=>a.number.localeCompare(b.number))
+    .map(a=>{
+      const fxSaldo = getFxSaldo(a.number,year);
+      const book    = round2(getSaldo(a.number,year));
+      const r       = parseNum(rates?.[a.currency]);
+      const rate    = r>0 ? r : null;
+      const target  = rate ? round2(fxSaldo*rate) : null;
+      const diff    = rate ? round2(target-book) : null;
+      const isGain  = !!diff && (a.category==="aktiven" ? diff>0 : diff<0);
+      const gainAllowed = a.category==="aktiven" && a.number.startsWith("10");
+      return { account:a, fxSaldo, book, rate, target, diff, isGain, gainAllowed,
+               defaultBook: !!diff && (!isGain || gainAllowed) };
+    });
+
+const makeRevalEntry = (row, gainAcc, lossAcc, year, idx) => {
+  const a = row.account;
+  const increase   = row.diff>0;                       // CHF-Saldo (Normalsicht) steigt
+  const accOnDebit = a.category==="aktiven" ? increase : !increase;
+  const counter    = row.isGain ? gainAcc : lossAcc;
+  return {
+    id: Date.now()+idx,
+    date: `${year}-12-31`,
+    description: `Fremdwährungsbewertung ${a.currency} ${fmt(row.fxSaldo)} @ ${fmtRate(row.rate)} (Kurs${row.isGain?"gewinn":"verlust"})`,
+    reference: `FW-BEW-${year}`,
+    debit:  accOnDebit ? a.number : counter,
+    credit: accOnDebit ? counter  : a.number,
+    amount: Math.abs(row.diff),
+    fxCurrency: a.currency, fxAmount: 0, fxReval: true,
+  };
+};
 
 // Real file download for standalone HTML
 const dlFile = (content, filename) => {
@@ -209,18 +309,98 @@ const AccountSelect = ({ accounts, value, onChange, placeholder="Konto wählen�
         {aktiven:"── AKTIVEN",passiven:"── PASSIVEN",ertrag:"── ERTRÄGE",aufwand:"── AUFWÄNDE"}[cat]
       }>
         {accounts.filter(a=>a.category===cat).sort((a,b)=>a.number.localeCompare(b.number)).map(a=>(
-          <option key={a.number} value={a.number}>{a.number} – {a.name}</option>
+          <option key={a.number} value={a.number}>
+            {a.number} – {a.name}{a.currency&&a.currency!==CHF?` [${a.currency}]`:""}
+          </option>
         ))}
       </optgroup>
     ))}
   </select>
 );
 
+const CurBadge = ({ cur }) => (!cur||cur===CHF) ? null : (
+  <span style={{ background:"#FFF7ED", color:"#C2410C", border:"1px solid #FED7AA",
+                 padding:"0 6px", borderRadius:4, fontSize:10.5, fontWeight:700,
+                 fontFamily:"'JetBrains Mono',monospace", marginLeft:6, verticalAlign:"middle" }}>
+    {cur}
+  </span>
+);
+
+// Eingabefelder für Fremdwährungsbuchungen (erscheinen nur, wenn ein FW-Konto beteiligt ist)
+// value: { debit, credit, amount, fxAmount, fxRate, fxReval } · onChange(key, value)
+const FxInputs = ({ accounts, value, onChange, compact=false }) => {
+  const { currency, error } = entryFxCurrency(accounts, value.debit, value.credit);
+  if(error) return (
+    <div style={{ marginTop:compact?4:10, fontSize:compact?10.5:12, color:"#B45309",
+                  padding:compact?0:"6px 10px", background:compact?"none":"#FFFBEB", borderRadius:5 }}>
+      ⚠ {error}
+    </div>
+  );
+  if(!currency) return null;
+  const sIS = compact
+    ? { ...IS, padding:"3px 6px", fontSize:11.5, fontFamily:"'JetBrains Mono',monospace", textAlign:"right" }
+    : { ...IS, fontFamily:"'JetBrains Mono',monospace", textAlign:"right" };
+  const revalBox = (
+    <label style={{ display:"flex", alignItems:"center", gap:5, fontSize:compact?10.5:12,
+                    color:"#64748B", cursor:"pointer", whiteSpace:"nowrap" }}
+      title="Nur CHF-Betrag ändern, Fremdwährungssaldo bleibt unverändert (Kursdifferenz / Bewertung)">
+      <input type="checkbox" checked={!!value.fxReval} onChange={e=>onChange("fxReval",e.target.checked)}/>
+      Kursdifferenz (nur CHF)
+    </label>
+  );
+  if(compact) return (
+    <div style={{ marginTop:4, display:"flex", flexDirection:"column", gap:3, alignItems:"flex-end" }}>
+      {!value.fxReval && <>
+        <input type="number" step="0.01" value={value.fxAmount??""} placeholder={`Betrag ${currency}`}
+          onChange={e=>onChange("fxAmount",e.target.value)} style={{ ...sIS, width:110 }}/>
+        <input type="number" step="0.0001" value={value.fxRate??""} placeholder="Kurs"
+          onChange={e=>onChange("fxRate",e.target.value)} style={{ ...sIS, width:110 }}/>
+      </>}
+      {revalBox}
+    </div>
+  );
+  return (
+    <div style={{ marginTop:10, padding:"10px 12px", background:"#FFF7ED", border:"1px solid #FED7AA",
+                  borderRadius:7, display:"grid", gridTemplateColumns:"150px 150px 1fr", gap:10, alignItems:"end" }}>
+      {!value.fxReval ? <>
+        <Field label={`Betrag ${currency} *`}>
+          <input type="number" step="0.01" min="0.01" value={value.fxAmount??""} placeholder="0.00"
+            onChange={e=>onChange("fxAmount",e.target.value)} style={sIS}/>
+        </Field>
+        <Field label={`Kurs CHF / 1 ${currency}`}>
+          <input type="number" step="0.0001" min="0" value={value.fxRate??""} placeholder="z. B. 0.9350"
+            onChange={e=>onChange("fxRate",e.target.value)} style={sIS}/>
+        </Field>
+      </> : (
+        <div style={{ gridColumn:"span 2", fontSize:12, color:"#9A3412", alignSelf:"center" }}>
+          Kursdifferenz: nur der CHF-Wert des {currency}-Kontos ändert sich.
+        </div>
+      )}
+      <div style={{ display:"flex", flexDirection:"column", gap:4, alignSelf:"center" }}>
+        {revalBox}
+        {!value.fxReval && (
+          <span style={{ fontSize:11, color:MUTED }}>
+            Transaktionskurs (Tageskurs bzw. Kurs gemäss Bank-/Kreditkartenbeleg). Der CHF-Betrag wird
+            berechnet; wird er überschrieben, passt sich der Kurs an.
+          </span>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const FxAmountNote = ({ e }) => !e.fxCurrency ? null : (
+  <div style={{ fontSize:10.5, color:"#C2410C", fontWeight:400, marginTop:1 }}>
+    {e.fxReval ? `Kursdifferenz ${e.fxCurrency}` : `${e.fxCurrency} ${fmt(e.fxAmount)} @ ${fmtRate(e.fxRate)}`}
+  </div>
+);
+
 // ═══════════════════════════════════════════════════════════════
 // TAB: JOURNAL
 // ═══════════════════════════════════════════════════════════════
-function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
-  const blank = { date:`${year}-01-01`, description:"", debit:"", credit:"", amount:"", reference:"" };
+function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFxRates, year }) {
+  const blank = { date:`${year}-01-01`, description:"", debit:"", credit:"", amount:"", reference:"",
+                  fxAmount:"", fxRate:"", fxReval:false };
   const [form,    setForm]    = useState(blank);
   const [error,   setError]   = useState("");
   const [filterY, setFilterY] = useState(true);
@@ -228,20 +408,19 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
   const [editing, setEditing] = useState(null); // {id, date, description, reference, debit, credit, amount}
   const [editErr, setEditErr] = useState("");
 
-  const f = (k,v) => setForm(p=>({...p,[k]:v}));
+  const f = (k,v) => setForm(p=>fxFormUpdate(p,k,v));
 
-  const startEdit = (e) => setEditing({ ...e, amount: String(e.amount) });
+  const startEdit = (e) => setEditing({ ...e, amount: String(e.amount),
+    fxAmount: e.fxAmount ? String(e.fxAmount) : "", fxRate: e.fxRate ? String(e.fxRate) : "",
+    fxReval: !!e.fxReval });
   const cancelEdit = () => { setEditing(null); setEditErr(""); };
   const saveEdit = () => {
-    if(!editing.date||!editing.description||!editing.debit||!editing.credit||!editing.amount){
-      setEditErr("Pflichtfelder: Datum, Text, Soll, Haben, Betrag."); return; }
-    if(editing.debit===editing.credit){ setEditErr("Soll ≠ Haben."); return; }
-    const amt = parseFloat(String(editing.amount).replace(",","."));
-    if(isNaN(amt)||amt<=0){ setEditErr("Betrag muss > 0 sein."); return; }
-    setEntries(p=>p.map(e=>e.id===editing.id?{...editing,amount:amt}:e));
+    const { entry, error } = normalizeEntry(editing, accounts);
+    if(error){ setEditErr(error); return; }
+    setEntries(p=>p.map(e=>e.id===editing.id?entry:e));
     setEditing(null); setEditErr("");
   };
-  const ef = (k,v) => setEditing(p=>({...p,[k]:v}));
+  const ef = (k,v) => setEditing(p=>fxFormUpdate(p,k,v));
 
   const visible = useMemo(()=>{
     const arr = filterY ? entries.filter(e=>e.date.startsWith(String(year))) : [...entries];
@@ -251,13 +430,10 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
   },[entries,year,filterY,sortDir]);
 
   const add = () => {
-    if(!form.date||!form.description||!form.debit||!form.credit||!form.amount){
-      setError("Pflichtfelder: Datum, Text, Soll, Haben, Betrag."); return; }
-    if(form.debit===form.credit){ setError("Soll ≠ Haben."); return; }
-    const amt = parseFloat(form.amount.replace(",","."));
-    if(isNaN(amt)||amt<=0){ setError("Betrag muss > 0 sein."); return; }
-    setEntries(p=>[...p,{ id:Date.now(), ...form, amount:amt }]);
-    setForm(p=>({...p, description:"", amount:"", reference:""}));
+    const { entry, error } = normalizeEntry(form, accounts);
+    if(error){ setError(error); return; }
+    setEntries(p=>[...p,{ ...entry, id:Date.now() }]);
+    setForm(p=>({...p, description:"", amount:"", reference:"", fxAmount:"", fxReval:false}));
     setError("");
   };
 
@@ -266,12 +442,16 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
   const confirmDelete = () => { setEntries(p=>p.filter(e=>e.id!==confirmDel)); setConfirmDel(null); setEditing(null); };
 
   const exportCSV = () => {
-    const h = ["Datum","Belegnr.","Buchungstext","Soll-Nr.","Soll-Konto","Haben-Nr.","Haben-Konto","Betrag CHF"];
+    const h = ["Datum","Belegnr.","Buchungstext","Soll-Nr.","Soll-Konto","Haben-Nr.","Haben-Konto","Betrag CHF",
+               "Währung","Betrag FW","Kurs"];
     const rows = visible.map(e=>[
       e.date, e.reference||"", e.description,
       e.debit, accounts.find(a=>a.number===e.debit)?.name||"",
       e.credit, accounts.find(a=>a.number===e.credit)?.name||"",
-      e.amount.toFixed(2).replace(".",","),
+      Number(e.amount).toFixed(2).replace(".",","),
+      e.fxCurrency||"",
+      e.fxCurrency ? (e.fxReval ? "Kursdifferenz" : Number(e.fxAmount).toFixed(2).replace(".",",")) : "",
+      e.fxCurrency && !e.fxReval ? String(e.fxRate).replace(".",",") : "",
     ]);
     dlFile([h,...rows].map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(";")).join("\r\n"),
       `Werckmeister_Journal_${year}.csv`);
@@ -279,7 +459,7 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
 
   const exportJSON = () => {
     dlFile(JSON.stringify({ verein:"Werckmeister", exportDate:new Date().toISOString(),
-      year, accounts, entries },null,2),
+      year, accounts, entries, fxRates },null,2),
       `Werckmeister_Backup_${new Date().toISOString().slice(0,10)}.json`);
   };
 
@@ -291,6 +471,7 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
         const d = JSON.parse(ev.target.result);
         if(d.accounts) setAccounts(d.accounts);
         if(d.entries)  setEntries(d.entries);
+        setFxRates(d.fxRates||{});
         alert("✓ Backup importiert!");
       } catch { alert("Fehler: Ungültige JSON-Datei."); }
     };
@@ -334,6 +515,7 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
           </Field>
           <button onClick={add} style={{...PB,height:38}}>+ Buchen</button>
         </div>
+        <FxInputs accounts={accounts} value={form} onChange={f}/>
         {error && (
           <div style={{color:"#DC2626",marginTop:8,fontSize:12,padding:"6px 10px",
                        background:"#FEF2F2",borderRadius:5}}>⚠ {error}</div>
@@ -408,6 +590,7 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
                       onKeyDown={ev=>{if(ev.key==="Enter")saveEdit();if(ev.key==="Escape")cancelEdit();}}
                       style={{...IS,padding:"4px 6px",fontFamily:"'JetBrains Mono',monospace",
                               textAlign:"right",fontSize:13,width:110,borderColor:"#F59E0B"}}/>
+                    <FxInputs accounts={accounts} value={editing} onChange={ef} compact/>
                   </Td>
                   <Td className="no-print" align="right">
                     <div style={{display:"flex",gap:4,justifyContent:"flex-end",flexWrap:"wrap"}}>
@@ -447,7 +630,9 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
                                 fontWeight:700,color:"#059669"}}>{e.credit}</span>
                   <span style={{color:MUTED,fontSize:11,marginLeft:5}}>{accName(e.credit)}</span>
                 </Td>
-                <Td align="right" style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:500}}>{fmt(e.amount)}</Td>
+                <Td align="right" style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:500}}>
+                  {fmt(e.amount)}<FxAmountNote e={e}/>
+                </Td>
                 <Td className="no-print" align="right">
                   <div style={{display:"flex",gap:4,justifyContent:"flex-end"}}>
                     <button onClick={()=>startEdit(e)}
@@ -501,8 +686,9 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, year }) {
 // ═══════════════════════════════════════════════════════════════
 // TAB: KONTENPLAN
 // ═══════════════════════════════════════════════════════════════
-function KontenplanTab({ accounts, setAccounts, entries, getSaldo, year }) {
-  const [form,    setForm]    = useState({number:"",name:"",category:"aktiven",group:""});
+function KontenplanTab({ accounts, setAccounts, entries, getSaldo, getFxSaldo, year }) {
+  const blankAcc = {number:"",name:"",category:"aktiven",group:"",currency:CHF};
+  const [form,    setForm]    = useState(blankAcc);
   const [error,   setError]   = useState("");
   const [open,    setOpen]    = useState(false);
   const [editing, setEditing] = useState(null); // { number, name, group }
@@ -511,13 +697,21 @@ function KontenplanTab({ accounts, setAccounts, entries, getSaldo, year }) {
 
   const f = (k,v) => setForm(p=>({...p,[k]:v}));
 
+  // Fremdwährung nur für Bilanzkonten – Aufwand/Ertrag wird immer in CHF geführt
+  const fxAllowed = (cat) => cat==="aktiven"||cat==="passiven";
+  const cleanCur  = (c) => (c||CHF).trim().toUpperCase();
+  const curError  = (c) => /^[A-Z]{3}$/.test(c) ? "" : "Währung als ISO-Code mit 3 Buchstaben angeben (z. B. EUR).";
+
   const addAccount = () => {
     if(!form.number.trim()||!form.name.trim()){ setError("Kontonummer und Name sind Pflicht."); return; }
     if(accounts.find(a=>a.number===form.number.trim())){
       setError(`Kontonummer ${form.number} existiert bereits.`); return; }
-    setAccounts(p=>[...p,{...form,number:form.number.trim(),name:form.name.trim()}]
-      .sort((a,b)=>a.number.localeCompare(b.number)));
-    setForm({number:"",name:"",category:"aktiven",group:""});
+    const currency = fxAllowed(form.category) ? cleanCur(form.currency) : CHF;
+    const ce = curError(currency); if(ce){ setError(ce); return; }
+    const acc = {...form,number:form.number.trim(),name:form.name.trim()};
+    if(currency===CHF) delete acc.currency; else acc.currency = currency;
+    setAccounts(p=>[...p,acc].sort((a,b)=>a.number.localeCompare(b.number)));
+    setForm(blankAcc);
     setError(""); setOpen(false);
   };
 
@@ -527,17 +721,23 @@ function KontenplanTab({ accounts, setAccounts, entries, getSaldo, year }) {
   };
 
   const startEdit = (a) => {
-    setEditing({ number:a.number, name:a.name, group:a.group||"" });
+    setEditing({ number:a.number, name:a.name, group:a.group||"", currency:a.currency||CHF });
     setEditErr("");
   };
 
   const saveEdit = () => {
     if(!editing.name.trim()){ setEditErr("Bezeichnung darf nicht leer sein."); return; }
-    setAccounts(p => p.map(a =>
-      a.number===editing.number
-        ? { ...a, name:editing.name.trim(), group:editing.group.trim() }
-        : a
-    ));
+    const orig = accounts.find(a=>a.number===editing.number);
+    const currency = fxAllowed(orig.category) ? cleanCur(editing.currency) : CHF;
+    const ce = curError(currency); if(ce){ setEditErr(ce); return; }
+    if(currency!==(orig.currency||CHF) && hasBookings(orig.number)){
+      setEditErr("Die Währung kann nur bei Konten ohne Buchungen geändert werden."); return; }
+    setAccounts(p => p.map(a => {
+      if(a.number!==editing.number) return a;
+      const n = { ...a, name:editing.name.trim(), group:editing.group.trim() };
+      if(currency===CHF) delete n.currency; else n.currency = currency;
+      return n;
+    }));
     setEditing(null); setEditErr("");
   };
 
@@ -569,7 +769,7 @@ function KontenplanTab({ accounts, setAccounts, entries, getSaldo, year }) {
 
       {open && (
         <Card title="Neues Konto anlegen">
-          <div style={{display:"grid",gridTemplateColumns:"110px 1fr 150px 1fr auto",gap:10,alignItems:"end"}}>
+          <div style={{display:"grid",gridTemplateColumns:"110px 1fr 150px 1fr 100px auto",gap:10,alignItems:"end"}}>
             <Field label="Konto-Nr. *">
               <input type="text" value={form.number} onChange={e=>f("number",e.target.value)}
                 placeholder="z.B. 3600" style={IS}/>
@@ -590,8 +790,25 @@ function KontenplanTab({ accounts, setAccounts, entries, getSaldo, year }) {
               <input type="text" value={form.group} onChange={e=>f("group",e.target.value)}
                 placeholder="z.B. Vereinserträge" style={IS}/>
             </Field>
+            <Field label="Währung">
+              <input type="text" list="fx-currencies" maxLength={3}
+                value={fxAllowed(form.category)?form.currency:CHF}
+                disabled={!fxAllowed(form.category)}
+                onChange={e=>f("currency",e.target.value.toUpperCase())}
+                style={{...IS,fontFamily:"'JetBrains Mono',monospace",
+                        background:fxAllowed(form.category)?"white":"#F1F5F9"}}/>
+            </Field>
             <button onClick={addAccount} style={{...PB,height:38}}>Anlegen</button>
           </div>
+          <datalist id="fx-currencies">
+            {[CHF,...COMMON_CURRENCIES].map(c=><option key={c} value={c}/>)}
+          </datalist>
+          {fxAllowed(form.category) && cleanCur(form.currency)!==CHF && (
+            <div style={{marginTop:8,fontSize:12,color:"#9A3412"}}>
+              Fremdwährungskonto: Buchungen werden mit Betrag in {cleanCur(form.currency)} und Kurs erfasst und
+              in CHF verbucht. Per 31.12. Bewertung zum Stichtagskurs im Tab «Fremdwährung».
+            </div>
+          )}
           {error && <div style={{color:"#DC2626",marginTop:8,fontSize:12}}>⚠ {error}</div>}
         </Card>
       )}
@@ -648,6 +865,22 @@ function KontenplanTab({ accounts, setAccounts, entries, getSaldo, year }) {
                             style={{...IS,padding:"5px 8px",fontSize:13,fontWeight:500,
                                     borderColor:"#F59E0B",boxShadow:"0 0 0 3px rgba(245,158,11,.15)"}}
                           />
+                          {fxAllowed(a.category) && (
+                            <div style={{display:"flex",alignItems:"center",gap:6,marginTop:4,fontSize:11,color:"#64748B"}}>
+                              Währung
+                              <input type="text" list="fx-currencies-edit" maxLength={3}
+                                value={editing.currency}
+                                disabled={hasBookings(a.number)}
+                                title={hasBookings(a.number)?"Konto hat Buchungen – Währung nicht änderbar":""}
+                                onChange={e=>setEditing(p=>({...p,currency:e.target.value.toUpperCase()}))}
+                                onKeyDown={e=>{ if(e.key==="Enter") saveEdit(); if(e.key==="Escape") cancelEdit(); }}
+                                style={{...IS,width:70,padding:"3px 6px",fontSize:12,
+                                        fontFamily:"'JetBrains Mono',monospace",borderColor:"#F59E0B"}}/>
+                              <datalist id="fx-currencies-edit">
+                                {[CHF,...COMMON_CURRENCIES].map(c=><option key={c} value={c}/>)}
+                              </datalist>
+                            </div>
+                          )}
                         </Td>
                         <Td>
                           <input
@@ -701,12 +934,17 @@ function KontenplanTab({ accounts, setAccounts, entries, getSaldo, year }) {
                       <tr key={a.number} className="hover-row">
                         <Td style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:700,
                                     color:cfg.color,fontSize:12}}>{a.number}</Td>
-                        <Td>{a.name}</Td>
+                        <Td>{a.name}<CurBadge cur={a.currency}/></Td>
                         <Td style={{color:MUTED,fontSize:12}}>{a.group||"—"}</Td>
                         <Td align="right" style={{fontFamily:"'JetBrains Mono',monospace",
                                                   fontWeight:saldo!==0?600:400,
                                                   color:saldo<0?"#DC2626":saldo>0?"#0F172A":"#CBD5E1"}}>
                           {saldo!==0?fmt(saldo):"—"}
+                          {a.currency&&a.currency!==CHF&&(
+                            <div style={{fontSize:10.5,fontWeight:500,color:"#C2410C"}}>
+                              {a.currency} {fmt(getFxSaldo(a.number,year))}
+                            </div>
+                          )}
                         </Td>
                         <Td className="no-print" align="right">
                           <div style={{display:"flex",gap:4,justifyContent:"flex-end"}}>
@@ -740,65 +978,145 @@ function KontenplanTab({ accounts, setAccounts, entries, getSaldo, year }) {
 // ═══════════════════════════════════════════════════════════════
 // TAB: HAUPTBUCH
 // ═══════════════════════════════════════════════════════════════
+const HB_CAT_COLOR = {aktiven:"#1D4ED8",passiven:"#15803D",ertrag:"#059669",aufwand:"#DC2626"};
+
+// Kontoblatt mit laufendem Saldo (CHF und ggf. Fremdwährung)
+const buildLedger = (acc, entries) => {
+  const num = acc.number;
+  const cur = acc.currency||CHF;
+  const isDbNormal = acc.category==="aktiven"||acc.category==="aufwand";
+  const ents = entries.filter(e=>e.debit===num||e.credit===num)
+    .sort((a,b)=>a.date.localeCompare(b.date)||a.id-b.id);
+  let run=0, fxRun=0;
+  const rows = ents.map(e=>{
+    const soll  = e.debit===num  ? Number(e.amount) : null;
+    const haben = e.credit===num ? Number(e.amount) : null;
+    const sign  = isDbNormal ? (soll!==null?1:-1) : (haben!==null?1:-1);
+    run += sign*Number(e.amount);
+    const fx = cur!==CHF && e.fxCurrency===cur ? sign*Number(e.fxAmount||0) : 0;
+    fxRun += fx;
+    const counter = e.debit===num ? e.credit : e.debit;
+    return {...e,soll,haben,saldo:round2(run),fx,fxSaldo:round2(fxRun),counter};
+  });
+  return {
+    account: acc, rows,
+    totSoll:  rows.reduce((s,r)=>s+(r.soll||0),0),
+    totHaben: rows.reduce((s,r)=>s+(r.haben||0),0),
+    saldo:    rows.length ? rows[rows.length-1].saldo   : 0,
+    fxSaldo:  rows.length ? rows[rows.length-1].fxSaldo : 0,
+  };
+};
+
+function LedgerTable({ ledger, accounts }) {
+  const { account, rows, totSoll, totHaben, saldo, fxSaldo } = ledger;
+  const cur  = account.currency||CHF;
+  const isFx = cur!==CHF;
+  const cols = isFx ? 10 : 7;
+  const mono = "'JetBrains Mono',monospace";
+  const footTd = {padding:"10px 12px",textAlign:"right",fontFamily:mono,fontWeight:700,borderTop:"2px solid #E2E8F0"};
+  return (
+    <table style={{width:"100%",borderCollapse:"collapse"}}>
+      <thead>
+        <tr>
+          <Th>Datum</Th>
+          <Th>Belegnr.</Th>
+          <Th>Buchungstext</Th>
+          <Th>Gegenkonto</Th>
+          {isFx&&<Th align="right" style={{color:"#C2410C"}}>Betrag {cur}</Th>}
+          {isFx&&<Th align="right" style={{color:"#C2410C"}}>Kurs</Th>}
+          <Th align="right" style={{color:"#1D4ED8"}}>Soll CHF</Th>
+          <Th align="right" style={{color:"#059669"}}>Haben CHF</Th>
+          {isFx&&<Th align="right" style={{color:"#C2410C"}}>Saldo {cur}</Th>}
+          <Th align="right">Saldo CHF</Th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.length===0 ? (
+          <tr><td colSpan={cols} style={{padding:32,textAlign:"center",color:MUTED,fontStyle:"italic"}}>
+            Keine Buchungen für dieses Konto
+          </td></tr>
+        ) : rows.map(r=>{
+          const cAcc = accounts.find(a=>a.number===r.counter);
+          return (
+            <tr key={r.id} className="hover-row">
+              <Td style={{fontFamily:mono,fontSize:12,color:"#475569"}}>{r.date}</Td>
+              <Td style={{color:MUTED,fontSize:12}}>{r.reference||"—"}</Td>
+              <Td>{r.description}</Td>
+              <Td style={{fontSize:12}}>
+                <span style={{fontFamily:mono,fontWeight:600,color:"#64748B"}}>{r.counter}</span>
+                {cAcc&&<span style={{color:MUTED,marginLeft:5}}>{cAcc.name}</span>}
+              </Td>
+              {isFx&&(
+                <Td align="right" style={{fontFamily:mono,fontSize:12,color:r.fx?"#C2410C":"#CBD5E1"}}>
+                  {r.fxReval ? <span style={{fontStyle:"italic",fontFamily:"inherit"}}>Kursdiff.</span>
+                             : r.fx ? fmt(r.fx) : "—"}
+                </Td>
+              )}
+              {isFx&&(
+                <Td align="right" style={{fontFamily:mono,fontSize:11.5,color:MUTED}}>
+                  {r.fxRate&&!r.fxReval ? fmtRate(r.fxRate) : "—"}
+                </Td>
+              )}
+              <Td align="right"
+                style={{fontFamily:mono,color:r.soll?"#1D4ED8":"#E2E8F0",fontWeight:r.soll?500:400}}>
+                {r.soll?fmt(r.soll):"—"}
+              </Td>
+              <Td align="right"
+                style={{fontFamily:mono,color:r.haben?"#059669":"#E2E8F0",fontWeight:r.haben?500:400}}>
+                {r.haben?fmt(r.haben):"—"}
+              </Td>
+              {isFx&&(
+                <Td align="right" style={{fontFamily:mono,fontWeight:600,color:"#C2410C"}}>{fmt(r.fxSaldo)}</Td>
+              )}
+              <Td align="right"
+                style={{fontFamily:mono,fontWeight:600,color:r.saldo>=0?"#0F172A":"#DC2626"}}>
+                {fmt(r.saldo)}
+              </Td>
+            </tr>
+          );
+        })}
+      </tbody>
+      {rows.length>0&&(
+        <tfoot>
+          <tr style={{background:"#F8FAFC"}}>
+            <td colSpan={isFx?6:4} style={{padding:"10px 12px",fontWeight:700,fontSize:13,
+                                           borderTop:"2px solid #E2E8F0"}}>Total</td>
+            <td style={{...footTd,color:"#1D4ED8"}}>{fmt(totSoll)}</td>
+            <td style={{...footTd,color:"#059669"}}>{fmt(totHaben)}</td>
+            {isFx&&<td style={{...footTd,color:"#C2410C"}}>{fmt(fxSaldo)}</td>}
+            <td style={{...footTd,fontSize:14,color:saldo>=0?"#0F172A":"#DC2626"}}>{fmt(saldo)}</td>
+          </tr>
+        </tfoot>
+      )}
+    </table>
+  );
+}
+
 function HauptbuchTab({ accounts, entries, year }) {
   const [selAcc, setSelAcc] = useState("");
   const [filterY, setFilterY] = useState(true);
 
   const account = accounts.find(a=>a.number===selAcc);
   const isDebitNormal = account&&(account.category==="aktiven"||account.category==="aufwand");
-  const catColor = {aktiven:"#1D4ED8",passiven:"#15803D",ertrag:"#059669",aufwand:"#DC2626"};
+  const catColor = HB_CAT_COLOR;
 
-  const rows = useMemo(()=>{
-    if(!selAcc) return [];
-    let ents = entries.filter(e=>e.debit===selAcc||e.credit===selAcc);
-    if(filterY) ents=ents.filter(e=>e.date.startsWith(String(year)));
-    ents=ents.sort((a,b)=>a.date.localeCompare(b.date)||a.id-b.id);
-    let run=0;
-    return ents.map(e=>{
-      const soll  = e.debit===selAcc  ? Number(e.amount) : null;
-      const haben = e.credit===selAcc ? Number(e.amount) : null;
-      run += isDebitNormal ? (soll||0)-(haben||0) : (haben||0)-(soll||0);
-      const counter = e.debit===selAcc ? e.credit : e.debit;
-      return {...e,soll,haben,saldo:run,counter};
-    });
-  },[entries,selAcc,filterY,year,isDebitNormal]);
+  const yearEntries = useMemo(()=>
+    filterY ? entries.filter(e=>e.date.startsWith(String(year))) : entries
+  ,[entries,filterY,year]);
 
-  const totSoll  = rows.reduce((s,r)=>s+(r.soll||0),0);
-  const totHaben = rows.reduce((s,r)=>s+(r.haben||0),0);
-  const saldo    = rows.length>0 ? rows[rows.length-1].saldo : 0;
+  const ledger = useMemo(()=> account ? buildLedger(account, yearEntries) : null, [account,yearEntries]);
+  const saldo  = ledger ? ledger.saldo : 0;
+  const isFx   = account && (account.currency||CHF)!==CHF;
 
   // Alle Konten mit Buchungen (wenn kein Konto ausgewählt)
   const allAccountRows = useMemo(()=>{
     if(selAcc) return [];
-    let filteredEntries = entries;
-    if(filterY) filteredEntries=filteredEntries.filter(e=>e.date.startsWith(String(year)));
     return accounts
       .slice()
       .sort((a,b)=>a.number.localeCompare(b.number))
-      .map(acc=>{
-        const accNum = acc.number;
-        const isDbNormal = acc.category==="aktiven"||acc.category==="aufwand";
-        let ents = filteredEntries.filter(e=>e.debit===accNum||e.credit===accNum);
-        if(ents.length===0) return null;
-        ents = ents.sort((a,b)=>a.date.localeCompare(b.date)||a.id-b.id);
-        let run=0;
-        const accRows = ents.map(e=>{
-          const soll  = e.debit===accNum  ? Number(e.amount) : null;
-          const haben = e.credit===accNum ? Number(e.amount) : null;
-          run += isDbNormal ? (soll||0)-(haben||0) : (haben||0)-(soll||0);
-          const counter = e.debit===accNum ? e.credit : e.debit;
-          return {...e,soll,haben,saldo:run,counter};
-        });
-        return {
-          account: acc,
-          rows: accRows,
-          totSoll: accRows.reduce((s,r)=>s+(r.soll||0),0),
-          totHaben: accRows.reduce((s,r)=>s+(r.haben||0),0),
-          saldo: accRows.length>0 ? accRows[accRows.length-1].saldo : 0
-        };
-      })
-      .filter(Boolean);
-  },[accounts,entries,selAcc,filterY,year]);
+      .map(acc=>buildLedger(acc, yearEntries))
+      .filter(g=>g.rows.length>0);
+  },[accounts,yearEntries,selAcc]);
 
   return (
     <div>
@@ -824,7 +1142,7 @@ function HauptbuchTab({ accounts, entries, year }) {
             </div>
             <div>
               <div style={{fontSize:10,color:MUTED,marginBottom:1}}>Bezeichnung</div>
-              <span style={{fontWeight:600}}>{account.name}</span>
+              <span style={{fontWeight:600}}>{account.name}</span><CurBadge cur={account.currency}/>
             </div>
             <div>
               <div style={{fontSize:10,color:MUTED,marginBottom:1}}>Kategorie</div>
@@ -842,6 +1160,11 @@ function HauptbuchTab({ accounts, entries, year }) {
                             color:saldo>=0?"#0F172A":"#DC2626"}}>
                 CHF {fmt(saldo)}
               </span>
+              {isFx&&(
+                <div style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:600,fontSize:13,color:"#C2410C"}}>
+                  {account.currency} {fmt(ledger.fxSaldo)}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -850,69 +1173,7 @@ function HauptbuchTab({ accounts, entries, year }) {
       {selAcc ? (
         <div style={{background:"white",borderRadius:10,border:"1px solid #E2E8F0",
                      overflow:"auto",boxShadow:"0 1px 3px rgba(0,0,0,.05)"}}>
-          <table style={{width:"100%",borderCollapse:"collapse"}}>
-            <thead>
-              <tr>
-                <Th>Datum</Th>
-                <Th>Belegnr.</Th>
-                <Th>Buchungstext</Th>
-                <Th>Gegenkonto</Th>
-                <Th align="right" style={{color:"#1D4ED8"}}>Soll</Th>
-                <Th align="right" style={{color:"#059669"}}>Haben</Th>
-                <Th align="right">Saldo</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.length===0 ? (
-                <tr><td colSpan={7} style={{padding:32,textAlign:"center",color:MUTED,fontStyle:"italic"}}>
-                  Keine Buchungen für dieses Konto
-                </td></tr>
-              ) : rows.map(r=>{
-                const cAcc = accounts.find(a=>a.number===r.counter);
-                return (
-                  <tr key={r.id} className="hover-row">
-                    <Td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:"#475569"}}>{r.date}</Td>
-                    <Td style={{color:MUTED,fontSize:12}}>{r.reference||"—"}</Td>
-                    <Td>{r.description}</Td>
-                    <Td style={{fontSize:12}}>
-                      <span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:600,color:"#64748B"}}>{r.counter}</span>
-                      {cAcc&&<span style={{color:MUTED,marginLeft:5}}>{cAcc.name}</span>}
-                    </Td>
-                    <Td align="right"
-                      style={{fontFamily:"'JetBrains Mono',monospace",
-                              color:r.soll?"#1D4ED8":"#E2E8F0",fontWeight:r.soll?500:400}}>
-                      {r.soll?fmt(r.soll):"—"}
-                    </Td>
-                    <Td align="right"
-                      style={{fontFamily:"'JetBrains Mono',monospace",
-                              color:r.haben?"#059669":"#E2E8F0",fontWeight:r.haben?500:400}}>
-                      {r.haben?fmt(r.haben):"—"}
-                    </Td>
-                    <Td align="right"
-                      style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:600,
-                              color:r.saldo>=0?"#0F172A":"#DC2626"}}>
-                      {fmt(r.saldo)}
-                    </Td>
-                  </tr>
-                );
-              })}
-            </tbody>
-            {rows.length>0&&(
-              <tfoot>
-                <tr style={{background:"#F8FAFC"}}>
-                  <td colSpan={4} style={{padding:"10px 12px",fontWeight:700,fontSize:13,
-                                          borderTop:"2px solid #E2E8F0"}}>Total</td>
-                  <td style={{padding:"10px 12px",textAlign:"right",fontFamily:"'JetBrains Mono',monospace",
-                               fontWeight:700,color:"#1D4ED8",borderTop:"2px solid #E2E8F0"}}>{fmt(totSoll)}</td>
-                  <td style={{padding:"10px 12px",textAlign:"right",fontFamily:"'JetBrains Mono',monospace",
-                               fontWeight:700,color:"#059669",borderTop:"2px solid #E2E8F0"}}>{fmt(totHaben)}</td>
-                  <td style={{padding:"10px 12px",textAlign:"right",fontFamily:"'JetBrains Mono',monospace",
-                               fontWeight:700,fontSize:14,borderTop:"2px solid #E2E8F0",
-                               color:saldo>=0?"#0F172A":"#DC2626"}}>{fmt(saldo)}</td>
-                </tr>
-              </tfoot>
-            )}
-          </table>
+          {ledger && <LedgerTable ledger={ledger} accounts={accounts}/>}
         </div>
       ) : (
         <div>
@@ -929,71 +1190,21 @@ function HauptbuchTab({ accounts, entries, year }) {
                 <span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:700,fontSize:14,
                               color:catColor[g.account.category]||"#333"}}>{g.account.number}</span>
                 <span style={{fontWeight:600,fontSize:14}}>{g.account.name}</span>
+                <CurBadge cur={g.account.currency}/>
                 <Badge cat={g.account.category}/>
                 <span style={{marginLeft:"auto",fontFamily:"'JetBrains Mono',monospace",fontWeight:700,
                               color:g.saldo>=0?"#0F172A":"#DC2626"}}>
+                  {(g.account.currency||CHF)!==CHF&&(
+                    <span style={{color:"#C2410C",marginRight:14,fontWeight:600}}>
+                      {g.account.currency} {fmt(g.fxSaldo)}
+                    </span>
+                  )}
                   CHF {fmt(g.saldo)}
                 </span>
               </div>
               <div style={{background:"white",borderRadius:"0 0 10px 10px",border:"1px solid #E2E8F0",
                            borderTop:"none",overflow:"auto",boxShadow:"0 1px 3px rgba(0,0,0,.05)"}}>
-                <table style={{width:"100%",borderCollapse:"collapse"}}>
-                  <thead>
-                    <tr>
-                      <Th>Datum</Th>
-                      <Th>Belegnr.</Th>
-                      <Th>Buchungstext</Th>
-                      <Th>Gegenkonto</Th>
-                      <Th align="right" style={{color:"#1D4ED8"}}>Soll</Th>
-                      <Th align="right" style={{color:"#059669"}}>Haben</Th>
-                      <Th align="right">Saldo</Th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {g.rows.map(r=>{
-                      const cAcc = accounts.find(a=>a.number===r.counter);
-                      return (
-                        <tr key={r.id} className="hover-row">
-                          <Td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:"#475569"}}>{r.date}</Td>
-                          <Td style={{color:MUTED,fontSize:12}}>{r.reference||"—"}</Td>
-                          <Td>{r.description}</Td>
-                          <Td style={{fontSize:12}}>
-                            <span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:600,color:"#64748B"}}>{r.counter}</span>
-                            {cAcc&&<span style={{color:MUTED,marginLeft:5}}>{cAcc.name}</span>}
-                          </Td>
-                          <Td align="right"
-                            style={{fontFamily:"'JetBrains Mono',monospace",
-                                    color:r.soll?"#1D4ED8":"#E2E8F0",fontWeight:r.soll?500:400}}>
-                            {r.soll?fmt(r.soll):"—"}
-                          </Td>
-                          <Td align="right"
-                            style={{fontFamily:"'JetBrains Mono',monospace",
-                                    color:r.haben?"#059669":"#E2E8F0",fontWeight:r.haben?500:400}}>
-                            {r.haben?fmt(r.haben):"—"}
-                          </Td>
-                          <Td align="right"
-                            style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:600,
-                                    color:r.saldo>=0?"#0F172A":"#DC2626"}}>
-                            {fmt(r.saldo)}
-                          </Td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                  <tfoot>
-                    <tr style={{background:"#F8FAFC"}}>
-                      <td colSpan={4} style={{padding:"10px 12px",fontWeight:700,fontSize:13,
-                                              borderTop:"2px solid #E2E8F0"}}>Total</td>
-                      <td style={{padding:"10px 12px",textAlign:"right",fontFamily:"'JetBrains Mono',monospace",
-                                   fontWeight:700,color:"#1D4ED8",borderTop:"2px solid #E2E8F0"}}>{fmt(g.totSoll)}</td>
-                      <td style={{padding:"10px 12px",textAlign:"right",fontFamily:"'JetBrains Mono',monospace",
-                                   fontWeight:700,color:"#059669",borderTop:"2px solid #E2E8F0"}}>{fmt(g.totHaben)}</td>
-                      <td style={{padding:"10px 12px",textAlign:"right",fontFamily:"'JetBrains Mono',monospace",
-                                   fontWeight:700,fontSize:14,borderTop:"2px solid #E2E8F0",
-                                   color:g.saldo>=0?"#0F172A":"#DC2626"}}>{fmt(g.saldo)}</td>
-                    </tr>
-                  </tfoot>
-                </table>
+                <LedgerTable ledger={g} accounts={accounts}/>
               </div>
             </div>
           ))}
@@ -1006,7 +1217,11 @@ function HauptbuchTab({ accounts, entries, year }) {
 // ═══════════════════════════════════════════════════════════════
 // TAB: BILANZ
 // ═══════════════════════════════════════════════════════════════
-function BilanzTab({ accounts, getSaldo, year }) {
+function BilanzTab({ accounts, getSaldo, getFxSaldo, fxRates, year }) {
+  const fxRows = computeFxValuation({ accounts, getSaldo, getFxSaldo, rates:fxRates?.[year], year })
+    .filter(r=>r.fxSaldo!==0||r.book!==0);
+  const fxMissingRate = fxRows.filter(r=>!r.rate);
+  const fxOpenLoss    = fxRows.filter(r=>r.diff && !r.isGain);
   const aktiven  = accounts.filter(a=>a.category==="aktiven").sort((a,b)=>a.number.localeCompare(b.number));
   const passiven = accounts.filter(a=>a.category==="passiven").sort((a,b)=>a.number.localeCompare(b.number));
   const ertraege = accounts.filter(a=>a.category==="ertrag").reduce((s,a)=>s+getSaldo(a.number,year),0);
@@ -1038,10 +1253,15 @@ function BilanzTab({ accounts, getSaldo, year }) {
             <tr key={a.number} className="hover-row">
               <td style={{padding:"4px 12px 4px 22px",fontSize:11.5,
                           fontFamily:"'JetBrains Mono',monospace",color:MUTED}}>{a.number}</td>
-              <td style={{padding:"4px 12px",fontSize:13}}>{a.name}</td>
+              <td style={{padding:"4px 12px",fontSize:13}}>{a.name}<CurBadge cur={a.currency}/></td>
               <td style={{padding:"4px 12px",textAlign:"right",fontFamily:"'JetBrains Mono',monospace",
                           fontSize:13,fontWeight:s!==0?500:400,color:s!==0?"#0F172A":"#CBD5E1"}}>
                 {s!==0?fmt(s):"—"}
+                {a.currency&&a.currency!==CHF&&getFxSaldo(a.number,year)!==0&&(
+                  <div style={{fontSize:10.5,fontWeight:400,color:"#C2410C"}}>
+                    {a.currency} {fmt(getFxSaldo(a.number,year))}
+                  </div>
+                )}
               </td>
             </tr>
           );
@@ -1085,6 +1305,17 @@ function BilanzTab({ accounts, getSaldo, year }) {
     pasHtml = pasHtml.replace(/<tr class="total-row"/, jrRow + `<tr class="total-row"`);
     html += pasHtml;
     html += `</td></tr></table>`;
+    if(fxRows.length){
+      html += `<h2 style="text-align:left;margin-top:14pt">Fremdwährungspositionen per 31.12.${year}</h2><table>`+
+        `<tr><th>Konto</th><th>Bezeichnung</th><th>Währung</th><th>Betrag FW</th><th>Stichtagskurs</th><th>Bilanzwert CHF</th></tr>`;
+      fxRows.forEach(r=>{
+        html += `<tr><td class="muted">${r.account.number}</td><td>${r.account.name}</td><td class="center">${r.account.currency}</td>`+
+          `<td class="amount">${fmt(r.fxSaldo)}</td><td class="amount">${r.rate?fmtRate(r.rate):"—"}</td>`+
+          `<td class="amount">${fmt(r.book)}</td></tr>`;
+      });
+      html += `</table><p class="muted" style="font-size:9pt">Umrechnung monetärer Fremdwährungspositionen zum Stichtagskurs; `+
+        `unrealisierte Kursgewinne auf Forderungen und Verbindlichkeiten werden nach dem Imparitätsprinzip nicht erfasst.</p>`;
+    }
     exportWord(html, `Werckmeister_Bilanz_${year}.docx`);
   };
 
@@ -1191,6 +1422,46 @@ function BilanzTab({ accounts, getSaldo, year }) {
         <div style={{marginTop:12,padding:"8px 12px",background:"#FEF2F2",borderRadius:6,
                      fontSize:12,color:"#DC2626",border:"1px solid #FECACA"}}>
           ⚠ Die Bilanz ist um CHF {fmt(diff)} nicht ausgeglichen. Prüfe die Eröffnungsbuchungen.
+        </div>
+      )}
+
+      {(fxMissingRate.length>0||fxOpenLoss.length>0)&&(
+        <div className="no-print" style={{marginTop:12,padding:"8px 12px",background:"#FFFBEB",borderRadius:6,
+                     fontSize:12,color:"#92400E",border:"1px solid #FDE68A"}}>
+          ⚠ Fremdwährungsbewertung per 31.12.{year} unvollständig:
+          {fxMissingRate.length>0&&<> Stichtagskurs fehlt für {[...new Set(fxMissingRate.map(r=>r.account.currency))].join(", ")}.</>}
+          {fxOpenLoss.length>0&&<> Ungebuchte Kursverluste auf {fxOpenLoss.map(r=>r.account.number).join(", ")}
+            {" "}(CHF {fmt(fxOpenLoss.reduce((s,r)=>s+Math.abs(r.diff),0))}).</>}
+          {" "}→ Tab «Fremdwährung».
+        </div>
+      )}
+
+      {fxRows.length>0&&(
+        <div style={{marginTop:16,background:"white",borderRadius:10,border:"1px solid #FED7AA",overflow:"hidden"}}>
+          <div style={{padding:"9px 14px",background:"#FFF7ED",borderBottom:"1px solid #FED7AA",
+                       fontWeight:700,fontSize:12,color:"#C2410C",letterSpacing:.4}}>
+            FREMDWÄHRUNGSPOSITIONEN PER 31.12.{year} · Angaben für den Anhang
+          </div>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>
+              <Th>Konto</Th><Th>Bezeichnung</Th><Th>Währung</Th>
+              <Th align="right">Betrag FW</Th><Th align="right">Stichtagskurs</Th><Th align="right">Bilanzwert CHF</Th>
+            </tr></thead>
+            <tbody>
+              {fxRows.map(r=>(
+                <tr key={r.account.number}>
+                  <Td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:MUTED}}>{r.account.number}</Td>
+                  <Td>{r.account.name}</Td>
+                  <Td style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:700,color:"#C2410C"}}>{r.account.currency}</Td>
+                  <Td align="right" style={{fontFamily:"'JetBrains Mono',monospace"}}>{fmt(r.fxSaldo)}</Td>
+                  <Td align="right" style={{fontFamily:"'JetBrains Mono',monospace",color:r.rate?"#0F172A":"#DC2626"}}>
+                    {r.rate?fmtRate(r.rate):"fehlt"}
+                  </Td>
+                  <Td align="right" style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:600}}>{fmt(r.book)}</Td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </div>
@@ -1352,6 +1623,195 @@ function ErfolgsrechnungTab({ accounts, getSaldo, year }) {
 
 
 // ═══════════════════════════════════════════════════════════════
+// TAB: FREMDWÄHRUNG (Stichtagskurse & Bewertung)
+// ═══════════════════════════════════════════════════════════════
+function FremdwaehrungTab({ accounts, setAccounts, setEntries, getSaldo, getFxSaldo, fxRates, setFxRates, year }) {
+  const rates = fxRates?.[year] || {};
+  const currencies = [...new Set(accounts.map(a=>a.currency).filter(c=>c&&c!==CHF))].sort();
+  const findDefault = (num) => accounts.find(a=>a.number===num) ? num : "";
+  const [gainAcc, setGainAcc] = useState(()=>findDefault(FX_GAIN_ACCOUNT.number));
+  const [lossAcc, setLossAcc] = useState(()=>findDefault(FX_LOSS_ACCOUNT.number));
+  const [override, setOverride] = useState({}); // Kontonummer → bool (Buchen ja/nein)
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+
+  const setRate = (cur, v) => setFxRates(p=>({ ...p, [year]: { ...(p?.[year]||{}), [cur]: v } }));
+
+  const rows = computeFxValuation({ accounts, getSaldo, getFxSaldo, rates, year });
+  const isChecked = (r) => override[r.account.number] ?? r.defaultBook;
+  const toBook = rows.filter(r=>r.diff && isChecked(r));
+
+  const missingStdAccounts = [FX_GAIN_ACCOUNT, FX_LOSS_ACCOUNT].filter(s=>!accounts.find(a=>a.number===s.number));
+  const createStdAccounts = () => {
+    setAccounts(p=>[...p, ...missingStdAccounts].sort((a,b)=>a.number.localeCompare(b.number)));
+    if(!gainAcc) setGainAcc(FX_GAIN_ACCOUNT.number);
+    if(!lossAcc) setLossAcc(FX_LOSS_ACCOUNT.number);
+  };
+
+  const book = () => {
+    setMsg(""); setErr("");
+    if(toBook.some(r=>r.isGain)  && !gainAcc){ setErr("Bitte Konto für Kursgewinne wählen."); return; }
+    if(toBook.some(r=>!r.isGain) && !lossAcc){ setErr("Bitte Konto für Kursverluste wählen."); return; }
+    const newEntries = toBook.map((r,i)=>makeRevalEntry(r, gainAcc, lossAcc, year, i));
+    setEntries(p=>[...p, ...newEntries]);
+    setOverride({});
+    setMsg(`✓ ${newEntries.length} Bewertungsbuchung${newEntries.length===1?"":"en"} per 31.12.${year} erfasst (Beleg FW-BEW-${year}).`);
+  };
+
+  const mono = "'JetBrains Mono',monospace";
+  const incomeAccs  = accounts.filter(a=>a.category==="ertrag");
+  const expenseAccs = accounts.filter(a=>a.category==="aufwand");
+  const shortSel = (list, value, onChange) => (
+    <select value={value} onChange={e=>onChange(e.target.value)} style={IS}>
+      <option value="">Konto wählen…</option>
+      {list.slice().sort((a,b)=>a.number.localeCompare(b.number)).map(a=>(
+        <option key={a.number} value={a.number}>{a.number} – {a.name}</option>
+      ))}
+    </select>
+  );
+
+  if(currencies.length===0) return (
+    <div style={{maxWidth:820,margin:"0 auto"}}>
+      <Card title="Fremdwährungskonten">
+        <div style={{fontSize:13,color:"#334155",lineHeight:1.7}}>
+          Noch keine Fremdwährungskonten vorhanden. Lege im <strong>Kontenplan</strong> ein Aktiv- oder Passivkonto
+          mit Währung an, z. B. <span style={{fontFamily:mono}}>1021 Bankkonto EUR</span> (Währung <span style={{fontFamily:mono}}>EUR</span>)
+          oder <span style={{fontFamily:mono}}>2001 Kreditoren USD</span>.
+        </div>
+      </Card>
+      <FxRulesInfo/>
+    </div>
+  );
+
+  return (
+    <div style={{maxWidth:1000,margin:"0 auto"}}>
+      <Card title={`Stichtagskurse per 31.12.${year}`}>
+        <div style={{display:"flex",gap:14,flexWrap:"wrap",alignItems:"end"}}>
+          {currencies.map(c=>(
+            <Field key={c} label={`CHF / 1 ${c}`} style={{width:150}}>
+              <input type="number" step="0.0001" min="0" value={rates[c]??""} placeholder="0.0000"
+                onChange={e=>setRate(c,e.target.value)}
+                style={{...IS,fontFamily:mono,textAlign:"right"}}/>
+            </Field>
+          ))}
+          <div style={{fontSize:11.5,color:MUTED,maxWidth:380,lineHeight:1.5}}>
+            Devisenkurs (Mittelkurs) am Bilanzstichtag, z. B. gemäss Jahresend-Kursliste der ESTV
+            oder Bankauszug per 31.12. Die Kurse werden mit den Daten gespeichert.
+          </div>
+        </div>
+      </Card>
+
+      <Card title={`Bewertung der Fremdwährungskonten per 31.12.${year}`}>
+        <div style={{overflow:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",minWidth:860}}>
+            <thead><tr>
+              <Th>Konto</Th>
+              <Th align="right">Saldo FW</Th>
+              <Th align="right">Buchwert CHF</Th>
+              <Th align="right">Ø Buchkurs</Th>
+              <Th align="right">Stichtagskurs</Th>
+              <Th align="right">Wert CHF</Th>
+              <Th align="right">Differenz</Th>
+              <Th align="center">Buchen</Th>
+            </tr></thead>
+            <tbody>
+              {rows.map(r=>{
+                const a = r.account;
+                const avg = r.fxSaldo ? r.book/r.fxSaldo : null;
+                return (
+                  <tr key={a.number} className="hover-row">
+                    <Td>
+                      <span style={{fontFamily:mono,fontWeight:700,fontSize:12,
+                                    color:a.category==="aktiven"?"#1D4ED8":"#15803D"}}>{a.number}</span>
+                      <span style={{marginLeft:6}}>{a.name}</span><CurBadge cur={a.currency}/>
+                    </Td>
+                    <Td align="right" style={{fontFamily:mono,color:"#C2410C"}}>{fmt(r.fxSaldo)}</Td>
+                    <Td align="right" style={{fontFamily:mono}}>{fmt(r.book)}</Td>
+                    <Td align="right" style={{fontFamily:mono,fontSize:12,color:MUTED}}>{avg?fmtRate(avg):"—"}</Td>
+                    <Td align="right" style={{fontFamily:mono,fontSize:12}}>
+                      {r.rate?fmtRate(r.rate):<span style={{color:"#DC2626",fontFamily:"inherit"}}>Kurs fehlt</span>}
+                    </Td>
+                    <Td align="right" style={{fontFamily:mono}}>{r.target!==null?fmt(r.target):"—"}</Td>
+                    <Td align="right" style={{fontFamily:mono,fontWeight:600,
+                         color:!r.diff?"#CBD5E1":r.isGain?"#059669":"#DC2626"}}>
+                      {!r.diff ? (r.rate?"0.00":"—") : <>
+                        {r.isGain?"+":"−"}{fmt(Math.abs(r.diff))}
+                        <div style={{fontSize:10,fontWeight:400,fontFamily:"inherit"}}>
+                          {r.isGain?"Kursgewinn":"Kursverlust"}
+                        </div>
+                      </>}
+                    </Td>
+                    <Td align="center">
+                      {r.diff ? (
+                        <label style={{display:"inline-flex",flexDirection:"column",alignItems:"center",gap:2,cursor:"pointer"}}>
+                          <input type="checkbox" checked={isChecked(r)}
+                            disabled={!r.isGain}
+                            title={!r.isGain?"Kursverluste müssen gebucht werden (Vorsichtsprinzip)":""}
+                            onChange={e=>setOverride(p=>({...p,[a.number]:e.target.checked}))}/>
+                          {r.isGain && !r.gainAllowed && (
+                            <span style={{fontSize:9.5,color:"#92400E",maxWidth:110,lineHeight:1.2}}>
+                              unrealisiert – Imparitätsprinzip
+                            </span>
+                          )}
+                        </label>
+                      ) : <span style={{color:"#CBD5E1"}}>—</span>}
+                    </Td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr auto",gap:10,alignItems:"end",marginTop:14}}>
+          <Field label="Gegenkonto Kursgewinne">{shortSel(incomeAccs, gainAcc, setGainAcc)}</Field>
+          <Field label="Gegenkonto Kursverluste">{shortSel(expenseAccs, lossAcc, setLossAcc)}</Field>
+          <button onClick={book} disabled={toBook.length===0}
+            style={{...PB,height:38,opacity:toBook.length?1:.45,cursor:toBook.length?"pointer":"default"}}>
+            {toBook.length ? `${toBook.length} Bewertungsbuchung${toBook.length===1?"":"en"} erstellen` : "Nichts zu buchen"}
+          </button>
+        </div>
+        {missingStdAccounts.length>0&&(
+          <div style={{marginTop:10,fontSize:12,color:"#64748B",display:"flex",gap:10,alignItems:"center"}}>
+            Standardkonten {missingStdAccounts.map(a=>`${a.number} ${a.name}`).join(" / ")} fehlen im Kontenplan.
+            <button onClick={createStdAccounts} style={{...SB,padding:"4px 10px"}}>Anlegen</button>
+          </div>
+        )}
+        {err&&<div style={{marginTop:10,padding:"6px 10px",background:"#FEF2F2",borderRadius:5,color:"#DC2626",fontSize:12}}>⚠ {err}</div>}
+        {msg&&<div style={{marginTop:10,padding:"6px 10px",background:"#F0FDF4",borderRadius:5,color:"#15803D",fontSize:12}}>{msg}</div>}
+        <div style={{marginTop:10,fontSize:11.5,color:MUTED,lineHeight:1.5}}>
+          Die Bewertung bezieht sich auf die Buchungen des Geschäftsjahres {year} (inkl. Eröffnungsbuchungen).
+          Bei nachträglich geändertem Kurs einfach erneut buchen – es wird nur die verbleibende Differenz erfasst.
+        </div>
+      </Card>
+
+      <FxRulesInfo/>
+    </div>
+  );
+}
+
+const FxRulesInfo = () => (
+  <Card title="Regeln (Schweizer KMU-Rechnungslegung, OR)">
+    <ul style={{fontSize:12.5,color:"#334155",lineHeight:1.7,paddingLeft:18}}>
+      <li><strong>Buchwährung CHF</strong> (OR 957a Abs. 4 / 958d Abs. 3): Alle Konten werden in CHF geführt;
+        Fremdwährungskonten zeigen zusätzlich den Saldo in Originalwährung.</li>
+      <li><strong>Laufende Buchungen</strong> zum Transaktionskurs (Tageskurs bzw. effektiver Kurs gemäss Bankbeleg).
+        Aufwand und Ertrag werden immer in CHF erfasst.</li>
+      <li><strong>Realisierte Kursdifferenzen</strong> (z. B. Abweichung zwischen Rechnungs- und Zahlungskurs) als
+        Buchung mit Häkchen «Kursdifferenz (nur CHF)» gegen Kursgewinne bzw. Kursverluste.</li>
+      <li><strong>Stichtagsbewertung</strong>: Monetäre Fremdwährungspositionen werden per 31.12. zum Stichtagskurs bewertet.
+        Kursverluste sind immer zu buchen (Vorsichtsprinzip, OR 960 Abs. 2).</li>
+      <li><strong>Unrealisierte Kursgewinne</strong>: auf flüssigen Mitteln und kurzfristigen Wertschriften (Konten 10xx,
+        beobachtbarer Marktpreis, OR 960b) zulässig; auf Forderungen und Verbindlichkeiten werden sie gemäss
+        Imparitätsprinzip standardmässig nicht erfasst.</li>
+      <li><strong>Eröffnung im Folgejahr</strong>: Fremdwährungskonten mit dem Betrag in Fremdwährung und dem
+        Stichtagskurs des Vorjahres eröffnen, damit FW- und CHF-Saldo übereinstimmen.</li>
+    </ul>
+  </Card>
+);
+
+
+// ═══════════════════════════════════════════════════════════════
 // TAB: BUCHUNGSASSISTENT (Claude AI)
 // ═══════════════════════════════════════════════════════════════
 function AssistentTab({ accounts, setEntries, year }) {
@@ -1375,7 +1835,7 @@ function AssistentTab({ accounts, setEntries, year }) {
 
   const accountList = accounts
     .sort((a,b)=>a.number.localeCompare(b.number))
-    .map(a=>`${a.number} – ${a.name} (${a.category})`)
+    .map(a=>`${a.number} – ${a.name} (${a.category}${a.currency&&a.currency!==CHF?`, Währung ${a.currency}`:""})`)
     .join("\n");
 
   const systemPrompt = `Du bist ein Schweizer Vereinsbuchhalter (doppelte Buchhaltung, Schweizer Kontenrahmen).
@@ -1389,7 +1849,19 @@ Regeln:
 - Bei privat vorgeschossenen Ausgaben: Haben = 2010 (Kontokorrent mahal)
 - Nur Kontonummern verwenden die im Kontenplan vorkommen
 - Betrag immer als positive Zahl
+- Buchwährung ist CHF: "amount" ist immer der Betrag in CHF
+- Wird ein Konto mit Fremdwährung (z.B. "Währung EUR") bebucht: zusätzlich "fxCurrency" (ISO-Code) und
+  "fxAmount" (positiver Betrag in Fremdwährung) angeben; "amount" = CHF zum Kurs gemäss Beleg bzw. Tageskurs
+- Aufwand und Ertrag immer in CHF; Fremdwährungsbeträge auf CHF-Konten in CHF umrechnen (fxCurrency/fxAmount = null)
 - Kein Markdown, nur reines JSON`;
+
+  // Fremdwährungsfelder eines KI-Vorschlags für das Formular aufbereiten
+  const prepFx = (s) => {
+    if(!s) return s;
+    const fx = parseNum(s.fxAmount), amt = parseNum(s.amount);
+    return { ...s, fxAmount: fx>0 ? String(fx) : "", fxRate: fx>0&&amt>0 ? String(+(amt/fx).toFixed(6)) : "",
+             fxReval:false };
+  };
 
   // ── Single beleg handlers ───────────────────────────────────
   const handleFile = (e) => {
@@ -1419,7 +1891,7 @@ Regeln:
         method:"POST", headers:{"Content-Type":"application/json","x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
         body:JSON.stringify({
           model:"claude-sonnet-4-20250514", max_tokens:1000,
-          system: systemPrompt+"\n\nAntworte NUR mit einem JSON-Objekt:\n{\"date\":\"YYYY-MM-DD\",\"description\":\"...\",\"reference\":\"...\",\"debit\":\"NNNN\",\"credit\":\"NNNN\",\"amount\":0.00,\"reasoning\":\"...\"}",
+          system: systemPrompt+"\n\nAntworte NUR mit einem JSON-Objekt:\n{\"date\":\"YYYY-MM-DD\",\"description\":\"...\",\"reference\":\"...\",\"debit\":\"NNNN\",\"credit\":\"NNNN\",\"amount\":0.00,\"fxCurrency\":null,\"fxAmount\":null,\"reasoning\":\"...\"}",
           messages:[{role:"user",content:userContent}]
         })
       });
@@ -1428,18 +1900,20 @@ Regeln:
       const raw = data.content?.map(b=>b.text||"").join("").trim();
       if(!raw) throw new Error("Keine Antwort von der API erhalten");
       const parsed = JSON.parse(raw.replace(/^```json\s*/,"").replace(/```\s*$/,"").trim());
-      setSuggestion(parsed);
+      setSuggestion(prepFx(parsed));
     } catch(err){ setError("Fehler: "+err.message); }
     setLoading(false);
   };
 
   const bookSingle = () => {
     if(!suggestion) return;
-    setEntries(p=>[...p,{id:Date.now(),date:suggestion.date,description:suggestion.description,
-      reference:suggestion.reference||"",debit:suggestion.debit,credit:suggestion.credit,
-      amount:Number(suggestion.amount)}]);
+    const { entry, error } = normalizeEntry(suggestion, accounts);
+    if(error){ setError(error); return; }
+    setEntries(p=>[...p,{ ...entry, id:Date.now() }]);
+    setError("");
     setBooked(true);
   };
+  const sf = (k,v) => setSuggestion(p=>fxFormUpdate(p,k,v));
 
   const resetSingle = () => { setText(""); removeFile(); setSuggestion(null); setBooked(false); setError(""); };
 
@@ -1494,25 +1968,19 @@ Antworte NUR mit einem JSON-Array, ein Objekt pro Transaktion in derselben Reihe
       const raw = data.content?.map(b=>b.text||"").join("").trim();
       if(!raw) throw new Error("Keine Antwort von der API erhalten");
       const parsed = JSON.parse(raw.replace(/^```json\s*/,"").replace(/```\s*$/,"").trim());
-      setCsvResults(prev=>prev.map((r,i)=>({...r,suggestion:parsed[i]||null})));
+      setCsvResults(prev=>prev.map((r,i)=>({...r,suggestion:prepFx(parsed[i])||null})));
       setCsvDone(true);
     } catch(err){ setError("CSV-Analyse Fehler: "+err.message); }
     setCsvLoading(false);
   };
 
   const bookSelected = () => {
-    const toBook = csvResults.filter(r=>r.selected&&r.suggestion&&!r.booked);
-    const newEntries = toBook.map(r=>({
-      id: Date.now()+Math.random(),
-      date: r.suggestion.date,
-      description: r.suggestion.description,
-      reference: r.suggestion.reference||"",
-      debit: r.suggestion.debit,
-      credit: r.suggestion.credit,
-      amount: Number(r.suggestion.amount),
-    }));
+    const results = csvResults.map(r=>
+      r.selected&&r.suggestion&&!r.booked ? { r, ...normalizeEntry(r.suggestion, accounts) } : { r });
+    const newEntries = results.filter(x=>x.entry).map(x=>({ ...x.entry, id: Date.now()+Math.random() }));
     setEntries(p=>[...p,...newEntries]);
-    setCsvResults(prev=>prev.map(r=>r.selected&&r.suggestion&&!r.booked?{...r,booked:true}:r));
+    setCsvResults(results.map(x=>
+      x.entry ? {...x.r,booked:true,error:""} : x.error ? {...x.r,error:x.error} : x.r));
   };
 
   const toggleRow = (i) => setCsvResults(prev=>prev.map((r,j)=>j===i?{...r,selected:!r.selected}:r));
@@ -1607,12 +2075,16 @@ Antworte NUR mit einem JSON-Array, ein Objekt pro Transaktion in derselben Reihe
               onChange={e=>setSuggestion(p=>({...p,reference:e.target.value}))} style={{...IS,fontSize:13}}/></Field></div>
           </div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 160px",gap:10,marginBottom:16}}>
-            <Field label="Soll (Debit)"><AccountSelect accounts={accounts} value={suggestion.debit} onChange={v=>setSuggestion(p=>({...p,debit:v}))}/></Field>
-            <Field label="Haben (Kredit)"><AccountSelect accounts={accounts} value={suggestion.credit} onChange={v=>setSuggestion(p=>({...p,credit:v}))}/></Field>
+            <Field label="Soll (Debit)"><AccountSelect accounts={accounts} value={suggestion.debit} onChange={v=>sf("debit",v)}/></Field>
+            <Field label="Haben (Kredit)"><AccountSelect accounts={accounts} value={suggestion.credit} onChange={v=>sf("credit",v)}/></Field>
             <Field label="Betrag CHF"><input type="number" step="0.05" value={suggestion.amount}
-              onChange={e=>setSuggestion(p=>({...p,amount:e.target.value}))}
+              onChange={e=>sf("amount",e.target.value)}
               style={{...IS,fontFamily:"'JetBrains Mono',monospace",textAlign:"right",fontSize:15,fontWeight:700}}/></Field>
           </div>
+          <div style={{marginTop:-6,marginBottom:14}}>
+            <FxInputs accounts={accounts} value={suggestion} onChange={sf}/>
+          </div>
+          {error&&<div style={{marginBottom:12,padding:"7px 10px",background:"#FEF2F2",borderRadius:5,color:"#DC2626",fontSize:12}}>⚠ {error}</div>}
           <div style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",background:"#F8FAFC",borderRadius:8,marginBottom:16}}>
             <div style={{textAlign:"center"}}>
               <div style={{fontSize:10,color:MUTED,marginBottom:2}}>SOLL</div>
@@ -1785,6 +2257,9 @@ Antworte NUR mit einem JSON-Array, ein Objekt pro Transaktion in derselben Reihe
                             ℹ️
                           </div>
                         )}
+                        {r.error&&!isBooked&&(
+                          <div style={{fontSize:12,color:"#DC2626",cursor:"help"}} title={r.error}>⚠</div>
+                        )}
                       </Td>
                     </tr>
                   );
@@ -1812,6 +2287,7 @@ Antworte NUR mit einem JSON-Array, ein Objekt pro Transaktion in derselben Reihe
 function App() {
   const [accounts, setAccounts] = useState(DEFAULT_ACCOUNTS);
   const [entries,  setEntries]  = useState([]);
+  const [fxRates,  setFxRates]  = useState({}); // { [Jahr]: { EUR:"0.93", … } } Stichtagskurse per 31.12.
   const [tab,      setTab]      = useState("journal");
   const [year,     setYear]     = useState(2025);
   const [loaded,   setLoaded]   = useState(false);
@@ -1826,6 +2302,7 @@ function App() {
         if(d.accounts) setAccounts(d.accounts);
         if(d.entries)  setEntries(d.entries);
         if(d.year)     setYear(d.year);
+        if(d.fxRates)  setFxRates(d.fxRates);
       }
     } catch(e) { /* first run */ }
     setLoaded(true);
@@ -1836,12 +2313,12 @@ function App() {
     if(!loaded) return;
     setSaving(true);
     const t = setTimeout(()=>{
-      try { localStorage.setItem(STORAGE_KEY,JSON.stringify({accounts,entries,year})); }
+      try { localStorage.setItem(STORAGE_KEY,JSON.stringify({accounts,entries,year,fxRates})); }
       catch(e){ console.error("Storage error:",e); }
       setSaving(false);
     },600);
     return ()=>clearTimeout(t);
-  },[accounts,entries,year,loaded]);
+  },[accounts,entries,year,fxRates,loaded]);
 
   // ── Account saldo ─────────────────────────────────────────
   const getSaldo = useCallback((num, filterYear=null)=>{
@@ -1853,12 +2330,25 @@ function App() {
     return (acc.category==="aktiven"||acc.category==="aufwand") ? d-c : c-d;
   },[accounts,entries]);
 
+  // ── Saldo in Fremdwährung (0 für CHF-Konten) ─────────────
+  const getFxSaldo = useCallback((num, filterYear=null)=>{
+    const acc = accounts.find(a=>a.number===num);
+    const cur = acc?.currency||CHF;
+    if(!acc||cur===CHF) return 0;
+    const ents = (filterYear ? entries.filter(e=>e.date.startsWith(String(filterYear))) : entries)
+      .filter(e=>e.fxCurrency===cur);
+    const d = ents.filter(e=>e.debit===num ).reduce((s,e)=>s+Number(e.fxAmount||0),0);
+    const c = ents.filter(e=>e.credit===num).reduce((s,e)=>s+Number(e.fxAmount||0),0);
+    return round2(acc.category==="aktiven" ? d-c : c-d);
+  },[accounts,entries]);
+
   const TABS = [
     { id:"journal",   label:"📝 Journal"        },
     { id:"kontenplan",label:"📋 Kontenplan"      },
     { id:"hauptbuch", label:"📖 Hauptbuch"       },
     { id:"bilanz",    label:"⚖️ Bilanz"          },
     { id:"erfolg",    label:"📊 Erfolgsrechnung" },
+    { id:"fremdwaehrung", label:"💱 Fremdwährung" },
     { id:"assistent",  label:"🤖 Buchungsassistent" },
   ];
 
@@ -1935,12 +2425,19 @@ function App() {
       {/* ── Content ── */}
       <div style={{maxWidth:1200,margin:"0 auto",padding:24}}>
         {tab==="journal"    && <JournalTab    accounts={accounts} setAccounts={setAccounts}
-                                               entries={entries}   setEntries={setEntries}  year={year}/>}
+                                               entries={entries}   setEntries={setEntries}
+                                               fxRates={fxRates}   setFxRates={setFxRates}  year={year}/>}
         {tab==="kontenplan" && <KontenplanTab  accounts={accounts} setAccounts={setAccounts}
-                                               entries={entries}   getSaldo={getSaldo} year={year}/>}
+                                               entries={entries}   getSaldo={getSaldo}
+                                               getFxSaldo={getFxSaldo} year={year}/>}
         {tab==="hauptbuch"  && <HauptbuchTab   accounts={accounts} entries={entries}         year={year}/>}
-        {tab==="bilanz"     && <BilanzTab       accounts={accounts} getSaldo={getSaldo}       year={year}/>}
+        {tab==="bilanz"     && <BilanzTab       accounts={accounts} getSaldo={getSaldo}
+                                               getFxSaldo={getFxSaldo} fxRates={fxRates}    year={year}/>}
         {tab==="erfolg"     && <ErfolgsrechnungTab accounts={accounts} getSaldo={getSaldo}    year={year}/>}
+        {tab==="fremdwaehrung" && <FremdwaehrungTab accounts={accounts} setAccounts={setAccounts}
+                                               setEntries={setEntries} getSaldo={getSaldo}
+                                               getFxSaldo={getFxSaldo} fxRates={fxRates}
+                                               setFxRates={setFxRates} year={year}/>}
         {tab==="assistent"  && <AssistentTab accounts={accounts} setEntries={setEntries} year={year}/>}
       </div>
     </div>
