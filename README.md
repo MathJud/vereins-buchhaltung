@@ -3,7 +3,27 @@ Eine doppelte Buchhaltung mit Kontenrahmen für Schweizer Vereine. Konten könne
 
 Auf der Website https://claude-buha.werckmeister.app/Werckmeister_Buchhaltung.html läuft eine Instanz. 
 
-Für die Claude-Belegsverarbeitung config.example.json duplizieren nach config.json – dann den Claude-API-Key eintragen. Ist im .gitignore drin. 
+Für die KI-Belegsverarbeitung `config.example.js` duplizieren nach `config.js` – dann den Claude-API-Key eintragen. Ist im .gitignore drin.
+
+## Lokales Modell statt Claude
+
+Der Buchungsassistent kann statt Claude auch ein lokales Modell über einen OpenAI-kompatiblen Server verwenden (Ollama, LM Studio, llama.cpp `llama-server`, vLLM). In `config.js`:
+
+```js
+window.LLM_CONFIG = {
+  provider: "openai",
+  baseUrl:  "http://localhost:11434/v1",   // Ollama
+  model:    "qwen2.5vl:7b",
+  jsonMode: true,
+  csvBatchSize: 15,
+};
+```
+
+- **CORS:** Der Server muss Anfragen aus dem Browser erlauben – Ollama mit `OLLAMA_ORIGINS="*" ollama serve`, LM Studio mit «Enable CORS».
+- **Belege:** Für Fotos/Scans ein Vision-Modell verwenden. PDFs werden im Browser per pdf.js in Text umgewandelt; Scans ohne Textebene werden als Bild (max. 3 Seiten) gesendet.
+- **CSV-Import:** Die Transaktionen werden in Blöcken (`csvBatchSize`) analysiert. Vorschläge mit Konten, die nicht im Kontenplan stehen, werden markiert und nicht gebucht.
+- Weitere Optionen siehe `config.example.js`.
+
 
 ## Fremdwährungskonten
 
