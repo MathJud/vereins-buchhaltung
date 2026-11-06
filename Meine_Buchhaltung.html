@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Verein Werckmeister — Buchhaltung</title>
+  <title>Meine Buchhaltung</title>
   <!-- Versionen fixiert: unpkg liefert ohne Version inzwischen Babel 8, das die Inline-JSX-Kompilierung bricht -->
   <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" crossorigin></script>
@@ -45,7 +45,7 @@
 
 
 // ═══════════════════════════════════════════════════════════════
-// DATEN: Schweizer Vereins-Kontenrahmen
+// DATEN: Schweizer Vereins-Kontenrahmen (eingebaute Standardvorlage, identisch mit kontenplaene/verein.json)
 // ═══════════════════════════════════════════════════════════════
 const DEFAULT_ACCOUNTS = [
   // AKTIVEN
@@ -97,6 +97,142 @@ const DEFAULT_ACCOUNTS = [
 const FX_GAIN_ACCOUNT = { number:"3450", name:"Kursgewinne (Fremdwährungen)",  category:"ertrag",  group:"Finanzerträge" };
 const FX_LOSS_ACCOUNT = { number:"6700", name:"Kursverluste (Fremdwährungen)", category:"aufwand", group:"Finanzaufwand" };
 
+// ═══════════════════════════════════════════════════════════════
+// KONFIGURATION: Name und Kontenplan-Vorlagen (optional in config.js)
+// ═══════════════════════════════════════════════════════════════
+// window.APP_CONFIG = {
+//   name: "Meine Buchhaltung",                       // Name für neue Buchhaltungen
+//   kontenplanVorlagen: [ { id, label, url }, … ],   // ersetzt die eingebauten Vorlagen
+//   defaultVorlage: "verein",                        // Vorlage beim ersten Start
+// };
+// Vorlagen sind JSON-Dateien im Kontenplan-Format (siehe kontenplaene/*.json). Sie werden per
+// fetch() relativ zur HTML-Datei geladen. Unter file:// blockieren Browser das – dann die Datei
+// über «Kontenplan importieren» wählen. Die Vereinsvorlage ist zusätzlich eingebaut (Fallback).
+const DEFAULT_ORG_NAME   = "Meine Buchhaltung";
+const BUILTIN_CHART_ID   = "verein";
+const BUILTIN_CHART_NAME = "Schweizer Vereins-Kontenrahmen";
+const APP_CONFIG = (() => {
+  const c = window.APP_CONFIG || {};
+  const vorlagen = Array.isArray(c.kontenplanVorlagen) && c.kontenplanVorlagen.length
+    ? c.kontenplanVorlagen.filter(v=>v && v.id && v.url)
+    : [ { id:"verein", label:BUILTIN_CHART_NAME,            url:"kontenplaene/verein.json" },
+        { id:"kmu",    label:"Schweizer KMU-Kontenrahmen", url:"kontenplaene/kmu.json"    } ];
+  return {
+    name: String(c.name||"").trim() || DEFAULT_ORG_NAME,
+    vorlagen,
+    defaultVorlage: vorlagen.some(v=>v.id===c.defaultVorlage) ? c.defaultVorlage : (vorlagen[0]?.id || BUILTIN_CHART_ID),
+  };
+})();
+
+// Dateinamen aus dem Namen der Buchhaltung: «Verein Muster» → «Verein_Muster»
+const fileBase = (name) =>
+  (String(name||"").normalize("NFC").replace(/[^\p{L}\p{N}]+/gu,"_").replace(/^_+|_+$/g,"") || "Buchhaltung");
+
+const escHtml = (v) => String(v??"").replace(/[&<>"]/g, c=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+// Kursdifferenz-Konten: Standard bzw. aus dem Kontenplan (fxAccounts: { gain:"Nr", loss:"Nr" })
+const defaultFxAccounts = () => ({ gain:FX_GAIN_ACCOUNT, loss:FX_LOSS_ACCOUNT });
+
+// Konto, unter dem die Bilanz das Jahresergebnis ausweist – kommt aus dem Kontenplan («resultAccount»)
+const DEFAULT_RESULT_ACCOUNT = "2900";
+
+const CATEGORIES = ["aktiven","passiven","ertrag","aufwand"];
+const CATEGORY_ALIASES = { aktiv:"aktiven", aktiva:"aktiven", passiv:"passiven", passiva:"passiven",
+                           erträge:"ertrag", ertraege:"ertrag", aufwände:"aufwand", aufwaende:"aufwand" };
+
+// Kontenplan validieren und normalisieren → { accounts, name, fxAccounts, resultAccount, errors:[…] }
+// Akzeptiert: Kontenplan-Datei { name, fxAccounts, resultAccount, accounts:[…] }, Buchhaltungs-Backup oder reines Array.
+const normalizeChart = (data) => {
+  const list = Array.isArray(data) ? data : data?.accounts;
+  const errors = [];
+  if(!Array.isArray(list) || !list.length) return { accounts:[], errors:["Keine Konten gefunden (Feld «accounts» fehlt oder ist leer)."] };
+  const seen = new Set(), accounts = [];
+  list.forEach((raw,i)=>{
+    const row = `Zeile ${i+1}`;
+    const number = String(raw?.number ?? "").trim();
+    const name   = String(raw?.name ?? "").trim();
+    let category = String(raw?.category ?? "").trim().toLowerCase();
+    category = CATEGORY_ALIASES[category] || category;
+    const group    = String(raw?.group ?? "").trim();
+    const currency = String(raw?.currency ?? "").trim().toUpperCase() || CHF;
+    if(!number || !name){ errors.push(`${row}: Kontonummer und Bezeichnung sind Pflicht.`); return; }
+    if(seen.has(number)){ errors.push(`${row}: Kontonummer ${number} kommt mehrfach vor.`); return; }
+    if(!CATEGORIES.includes(category)){
+      errors.push(`${row} (${number}): Kategorie «${raw?.category??""}» ungültig – erlaubt: ${CATEGORIES.join(", ")}.`); return; }
+    if(!/^[A-Z]{3}$/.test(currency)){ errors.push(`${row} (${number}): Währung «${currency}» ist kein ISO-Code.`); return; }
+    if(currency!==CHF && category!=="aktiven" && category!=="passiven"){
+      errors.push(`${row} (${number}): Fremdwährung nur für Aktiven/Passiven erlaubt.`); return; }
+    seen.add(number);
+    const acc = { number, name, category, group };
+    if(currency!==CHF) acc.currency = currency;
+    accounts.push(acc);
+  });
+  accounts.sort((a,b)=>a.number.localeCompare(b.number));
+  // Kontenplan-Datei: «name» = Name des Kontenplans · Backup: «name» = Organisation, «kontenplan» = Plan
+  const isBackup = Array.isArray(data?.entries);
+  const name = typeof data?.kontenplan==="string" ? data.kontenplan.trim()
+             : !isBackup && typeof data?.name==="string" ? data.name.trim() : "";
+  const resultAccount = String(data?.resultAccount ?? "").trim() || null;
+  return { accounts, name, fxAccounts: data?.fxAccounts || null, resultAccount, errors };
+};
+
+// Kontenplan aus CSV: Nr;Bezeichnung;Kategorie;Gruppe;Währung (Kopfzeile, Trennzeichen ; , oder Tab)
+const parseChartCsv = (text) => {
+  const lines = text.replace(/^﻿/,"").split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2) throw new Error("CSV enthält keine Konten.");
+  const sep = [";","\t",","].find(s=>lines[0].includes(s)) || ";";
+  const split = (l) => { const out=[]; let cur="", q=false;
+    for(let i=0;i<l.length;i++){ const ch=l[i];
+      if(q){ if(ch==='"'){ if(l[i+1]==='"'){cur+='"';i++;} else q=false; } else cur+=ch; }
+      else if(ch==='"') q=true; else if(ch===sep){ out.push(cur); cur=""; } else cur+=ch; }
+    out.push(cur); return out.map(s=>s.trim()); };
+  const head = split(lines[0]).map(h=>h.toLowerCase());
+  const col = (...names) => head.findIndex(h=>names.some(n=>h===n||h.startsWith(n)));
+  const c = { number:col("nr","konto","number","kontonummer"), name:col("bezeichnung","name","kontoname"),
+              category:col("kategorie","category","typ"), group:col("gruppe","group"),
+              currency:col("währung","waehrung","currency") };
+  if(c.number<0||c.name<0||c.category<0)
+    throw new Error("CSV-Kopfzeile braucht mindestens die Spalten Nr, Bezeichnung und Kategorie.");
+  return lines.slice(1).map(l=>{ const v = split(l);
+    return { number:v[c.number], name:v[c.name], category:v[c.category],
+             group: c.group>=0 ? v[c.group] : "", currency: c.currency>=0 ? v[c.currency] : "" }; });
+};
+
+// Vorlage laden (fetch). Die eingebaute Vereinsvorlage dient als Fallback, wenn fetch scheitert (file://).
+const loadChartTemplate = async (vorlage) => {
+  try {
+    const res = await fetch(vorlage.url, { cache:"no-cache" });
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    return normalizeChart(await res.json());
+  } catch(err) {
+    if(vorlage.id===BUILTIN_CHART_ID)
+      return { accounts:DEFAULT_ACCOUNTS, name:BUILTIN_CHART_NAME, fxAccounts:{ gain:"3450", loss:"6700" }, resultAccount:DEFAULT_RESULT_ACCOUNT, errors:[] };
+    throw new Error(`Vorlage «${vorlage.label}» konnte nicht geladen werden (${vorlage.url}: ${err.message}). `+
+      (location.protocol==="file:" ? "Beim Öffnen als Datei (file://) blockiert der Browser das Nachladen – "+
+        "die Datei stattdessen über «Kontenplan importieren» wählen oder die Seite über einen Webserver öffnen." : ""));
+  }
+};
+
+// Neuen Kontenplan mit bestehenden Buchungen abgleichen:
+//  – Konten mit Buchungen, die im neuen Plan fehlen, werden beibehalten
+//  – Währungswechsel eines bebuchten Kontos ist nicht erlaubt
+const mergeChartWithEntries = (newAccounts, oldAccounts, entries) => {
+  const used = new Set(entries.flatMap(e=>[e.debit,e.credit]));
+  const byNum = new Map(newAccounts.map(a=>[a.number,a]));
+  const kept = [], errors = [], changedCat = [];
+  for(const old of oldAccounts){
+    if(!used.has(old.number)) continue;
+    const n = byNum.get(old.number);
+    if(!n){ kept.push(old); continue; }
+    if((n.currency||CHF)!==(old.currency||CHF))
+      errors.push(`Konto ${old.number}: Währung ${old.currency||CHF} → ${n.currency||CHF} nicht möglich (Konto hat Buchungen).`);
+    if(n.category!==old.category) changedCat.push(`${old.number} (${old.category} → ${n.category})`);
+  }
+  // Konten, die in Buchungen vorkommen, aber gar nicht im alten Plan waren, bleiben unverändert verwaist
+  return { accounts:[...newAccounts, ...kept].sort((a,b)=>a.number.localeCompare(b.number)), kept, errors, changedCat };
+};
+
+// Bestehende Daten nutzen weiterhin diesen Schlüssel (Kompatibilität mit früheren Versionen)
 const STORAGE_KEY = "werckmeister_buch_v1";
 
 // ═══════════════════════════════════════════════════════════════
@@ -418,7 +554,7 @@ const FxAmountNote = ({ e }) => !e.fxCurrency ? null : (
 // ═══════════════════════════════════════════════════════════════
 // TAB: JOURNAL
 // ═══════════════════════════════════════════════════════════════
-function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFxRates, year }) {
+function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFxRates, year, settings, setSettings }) {
   const blank = { date:`${year}-01-01`, description:"", debit:"", credit:"", amount:"", reference:"",
                   fxAmount:"", fxRate:"", fxReval:false };
   const [form,    setForm]    = useState(blank);
@@ -474,13 +610,13 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
       e.fxCurrency && !e.fxReval ? String(e.fxRate).replace(".",",") : "",
     ]);
     dlFile([h,...rows].map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(";")).join("\r\n"),
-      `Werckmeister_Journal_${year}.csv`);
+      `${fileBase(settings.name)}_Journal_${year}.csv`);
   };
 
   const exportJSON = () => {
-    dlFile(JSON.stringify({ verein:"Werckmeister", exportDate:new Date().toISOString(),
-      year, accounts, entries, fxRates },null,2),
-      `Werckmeister_Backup_${new Date().toISOString().slice(0,10)}.json`);
+    dlFile(JSON.stringify({ name:settings.name, kontenplan:settings.chartName, fxAccounts:settings.fxAccounts, resultAccount:settings.resultAccount,
+      exportDate:new Date().toISOString(), year, accounts, entries, fxRates },null,2),
+      `${fileBase(settings.name)}_Backup_${new Date().toISOString().slice(0,10)}.json`);
   };
 
   const importJSON = (e) => {
@@ -492,7 +628,14 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
         if(d.accounts) setAccounts(d.accounts);
         if(d.entries)  setEntries(d.entries);
         setFxRates(d.fxRates||{});
-        alert("✓ Backup importiert!");
+        // Name der Organisation (ältere Backups: Feld «verein»), Kontenplan-Name, Kursdifferenz-Konten
+        const name = String(d.name ?? d.verein ?? "").trim();
+        setSettings(p=>({ ...p,
+          ...(name ? { name } : {}),
+          ...(typeof d.kontenplan==="string" ? { chartName:d.kontenplan } : {}),
+          ...(d.fxAccounts ? { fxAccounts:d.fxAccounts } : {}),
+          ...(d.resultAccount ? { resultAccount:String(d.resultAccount) } : {}) }));
+        alert(`✓ Backup${name?` «${name}»`:""} importiert!`);
       } catch { alert("Fehler: Ungültige JSON-Datei."); }
     };
     r.readAsText(file); e.target.value="";
@@ -783,7 +926,10 @@ function KontenplanTab({ accounts, setAccounts, entries, getSaldo, getFxSaldo, y
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-        <span style={{fontSize:13,color:"#64748B"}}>{accounts.length} Konten · Kontenrahmen {year}</span>
+        <span style={{fontSize:13,color:"#64748B"}}>
+          {accounts.length} Konten · Kontenrahmen {year}
+          <span style={{fontSize:11.5,marginLeft:10,color:MUTED}}>Vorlage wechseln, Import/Export: ⚙️ Einstellungen</span>
+        </span>
         <button onClick={()=>setOpen(s=>!s)} style={PB}>{open?"Abbrechen":"+ Neues Konto"}</button>
       </div>
 
@@ -1237,7 +1383,7 @@ function HauptbuchTab({ accounts, entries, year }) {
 // ═══════════════════════════════════════════════════════════════
 // TAB: BILANZ
 // ═══════════════════════════════════════════════════════════════
-function BilanzTab({ accounts, getSaldo, getFxSaldo, fxRates, year }) {
+function BilanzTab({ accounts, getSaldo, getFxSaldo, fxRates, year, settings }) {
   const fxRows = computeFxValuation({ accounts, getSaldo, getFxSaldo, rates:fxRates?.[year], year })
     .filter(r=>r.fxSaldo!==0||r.book!==0);
   const fxMissingRate = fxRows.filter(r=>!r.rate);
@@ -1247,6 +1393,7 @@ function BilanzTab({ accounts, getSaldo, getFxSaldo, fxRates, year }) {
   const ertraege = accounts.filter(a=>a.category==="ertrag").reduce((s,a)=>s+getSaldo(a.number,year),0);
   const aufwaende= accounts.filter(a=>a.category==="aufwand").reduce((s,a)=>s+getSaldo(a.number,year),0);
   const jahrRes  = ertraege - aufwaende;
+  const resultNr = settings?.resultAccount || DEFAULT_RESULT_ACCOUNT;   // Konto-Nr. gemäss Kontenplan
 
   const totalAkt = aktiven.reduce((s,a)=>s+getSaldo(a.number,year),0);
   const totalPas = passiven.reduce((s,a)=>s+getSaldo(a.number,year),0)+jahrRes;
@@ -1313,14 +1460,14 @@ function BilanzTab({ accounts, getSaldo, getFxSaldo, fxRates, year }) {
       h += `<tr class="total-row" style="color:${color}"><td colspan="2">TOTAL ${title}</td><td class="amount">CHF ${fmt(total)}</td></tr></table>`;
       return h;
     };
-    let html = `<h1>Verein Werckmeister</h1><h2>Bilanz per 31. Dezember ${year}</h2>`;
+    let html = `<h1>${escHtml(settings.name)}</h1><h2>Bilanz per 31. Dezember ${year}</h2>`;
     html += `<table style="border:none"><tr style="vertical-align:top"><td style="border:none;width:50%;padding-right:8pt">`;
     html += renderSide("AKTIVEN", aktiven, aktGroups, "#1D4ED8", totalAkt);
     html += `</td><td style="border:none;width:50%;padding-left:8pt">`;
     let pasHtml = renderSide("PASSIVEN", passiven, pasGroups, "#15803D", totalPas);
     // Jahresergebnis einfügen vor dem letzten </table>
     const jrRow = `<tr class="section-header"><td colspan="3">Jahresergebnis ${year}</td></tr>` +
-      `<tr><td class="muted">2900</td><td>${jahrRes>=0?"Jahresgewinn":"Jahresverlust"} ${year}</td>` +
+      `<tr><td class="muted">${escHtml(resultNr)}</td><td>${jahrRes>=0?"Jahresgewinn":"Jahresverlust"} ${year}</td>` +
       `<td class="amount" style="font-weight:700;color:${jahrRes>=0?"#15803D":"#DC2626"}">${jahrRes>=0?"":"-"}${fmt(Math.abs(jahrRes))}</td></tr>`;
     pasHtml = pasHtml.replace(/<tr class="total-row"/, jrRow + `<tr class="total-row"`);
     html += pasHtml;
@@ -1336,7 +1483,7 @@ function BilanzTab({ accounts, getSaldo, getFxSaldo, fxRates, year }) {
       html += `</table><p class="muted" style="font-size:9pt">Umrechnung monetärer Fremdwährungspositionen zum Stichtagskurs; `+
         `unrealisierte Kursgewinne auf Forderungen und Verbindlichkeiten werden nach dem Imparitätsprinzip nicht erfasst.</p>`;
     }
-    exportWord(html, `Werckmeister_Bilanz_${year}.docx`);
+    exportWord(html, `${fileBase(settings.name)}_Bilanz_${year}.docx`);
   };
 
   return (
@@ -1362,9 +1509,9 @@ function BilanzTab({ accounts, getSaldo, getFxSaldo, fxRates, year }) {
 
       {/* Print header */}
       <div style={{textAlign:"center",marginBottom:20}}>
-        <div style={{fontWeight:800,fontSize:18,letterSpacing:-.5}}>Verein Werckmeister</div>
+        <div style={{fontWeight:800,fontSize:18,letterSpacing:-.5}}>{settings.name}</div>
         <div style={{color:"#64748B",fontSize:13,marginTop:3}}>Bilanz per 31. Dezember {year}</div>
-        <div style={{color:MUTED,fontSize:11,marginTop:1}}>Schweizer Vereins-Kontenrahmen · Doppelte Buchhaltung</div>
+        <div style={{color:MUTED,fontSize:11,marginTop:1}}>{settings.chartName||"Eigener Kontenplan"} · Doppelte Buchhaltung</div>
       </div>
 
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
@@ -1412,7 +1559,7 @@ function BilanzTab({ accounts, getSaldo, getFxSaldo, fxRates, year }) {
               </tr>
               <tr style={{borderBottom:"1px solid #E2E8F0"}}>
                 <td style={{padding:"4px 12px 7px 22px",fontSize:11.5,
-                             fontFamily:"'JetBrains Mono',monospace",color:MUTED}}>2900</td>
+                             fontFamily:"'JetBrains Mono',monospace",color:MUTED}}>{resultNr}</td>
                 <td style={{padding:"4px 12px 7px",fontSize:13}}>
                   {jahrRes>=0?"Jahresgewinn":"Jahresverlust"} {year}
                 </td>
@@ -1491,7 +1638,7 @@ function BilanzTab({ accounts, getSaldo, getFxSaldo, fxRates, year }) {
 // ═══════════════════════════════════════════════════════════════
 // TAB: ERFOLGSRECHNUNG
 // ═══════════════════════════════════════════════════════════════
-function ErfolgsrechnungTab({ accounts, getSaldo, year }) {
+function ErfolgsrechnungTab({ accounts, getSaldo, year, settings }) {
   const erAccs = accounts.filter(a=>a.category==="ertrag" ).sort((a,b)=>a.number.localeCompare(b.number));
   const awAccs = accounts.filter(a=>a.category==="aufwand").sort((a,b)=>a.number.localeCompare(b.number));
   const totEr  = erAccs.reduce((s,a)=>s+getSaldo(a.number,year),0);
@@ -1580,14 +1727,14 @@ function ErfolgsrechnungTab({ accounts, getSaldo, year }) {
       h += `<tr class="total-row" style="color:${color}"><td colspan="2">TOTAL ${title}</td><td class="amount">CHF ${fmt(total)}</td></tr></table>`;
       return h;
     };
-    let html = `<h1>Verein Werckmeister</h1><h2>Erfolgsrechnung ${year} · 1. Januar – 31. Dezember</h2>`;
+    let html = `<h1>${escHtml(settings.name)}</h1><h2>Erfolgsrechnung ${year} · 1. Januar – 31. Dezember</h2>`;
     html += renderSection("ERTRÄGE", erAccs, erGroups, "#059669", totEr);
     html += renderSection("AUFWÄNDE", awAccs, awGroups, "#DC2626", totAw);
     const resColor = jahrRes>=0 ? "#15803D" : "#DC2626";
     html += `<table><tr class="total-row" style="color:${resColor}"><td colspan="2" style="font-size:12pt">${jahrRes>=0?"JAHRESGEWINN":"JAHRESVERLUST"} ${year}</td>` +
       `<td class="amount" style="font-size:14pt">CHF ${fmt(Math.abs(jahrRes))}</td></tr>` +
       `<tr><td colspan="3" class="muted" style="font-size:9pt;border:none">Erträge ${fmt(totEr)} – Aufwände ${fmt(totAw)}</td></tr></table>`;
-    exportWord(html, `Werckmeister_Erfolgsrechnung_${year}.docx`);
+    exportWord(html, `${fileBase(settings.name)}_Erfolgsrechnung_${year}.docx`);
   };
 
   return (
@@ -1604,7 +1751,7 @@ function ErfolgsrechnungTab({ accounts, getSaldo, year }) {
       </div>
 
       <div style={{textAlign:"center",marginBottom:20}}>
-        <div style={{fontWeight:800,fontSize:18,letterSpacing:-.5}}>Verein Werckmeister</div>
+        <div style={{fontWeight:800,fontSize:18,letterSpacing:-.5}}>{settings.name}</div>
         <div style={{color:"#64748B",fontSize:13,marginTop:3}}>Erfolgsrechnung {year}</div>
       </div>
 
@@ -1645,12 +1792,23 @@ function ErfolgsrechnungTab({ accounts, getSaldo, year }) {
 // ═══════════════════════════════════════════════════════════════
 // TAB: FREMDWÄHRUNG (Stichtagskurse & Bewertung)
 // ═══════════════════════════════════════════════════════════════
-function FremdwaehrungTab({ accounts, setAccounts, setEntries, getSaldo, getFxSaldo, fxRates, setFxRates, year }) {
+function FremdwaehrungTab({ accounts, setAccounts, setEntries, getSaldo, getFxSaldo, fxRates, setFxRates, year, settings }) {
+  // Kursdifferenz-Konten gemäss Kontenplan (Vorlage), sonst Standard 3450/6700.
+  // Fehlt ein konfiguriertes Konto im Kontenplan, wird es mit Standardnamen zum Anlegen angeboten.
+  const fxStd = (() => {
+    const d = defaultFxAccounts(), cfg = settings?.fxAccounts || {};
+    const pick = (num, base) => {
+      if(!num) return base;
+      const a = accounts.find(x=>x.number===String(num));
+      return a ? { number:a.number, name:a.name, category:a.category, group:a.group||"" } : { ...base, number:String(num) };
+    };
+    return { gain:pick(cfg.gain, d.gain), loss:pick(cfg.loss, d.loss) };
+  })();
   const rates = fxRates?.[year] || {};
   const currencies = [...new Set(accounts.map(a=>a.currency).filter(c=>c&&c!==CHF))].sort();
   const findDefault = (num) => accounts.find(a=>a.number===num) ? num : "";
-  const [gainAcc, setGainAcc] = useState(()=>findDefault(FX_GAIN_ACCOUNT.number));
-  const [lossAcc, setLossAcc] = useState(()=>findDefault(FX_LOSS_ACCOUNT.number));
+  const [gainAcc, setGainAcc] = useState(()=>findDefault(fxStd.gain.number));
+  const [lossAcc, setLossAcc] = useState(()=>findDefault(fxStd.loss.number));
   const [override, setOverride] = useState({}); // Kontonummer → bool (Buchen ja/nein)
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
@@ -1661,11 +1819,11 @@ function FremdwaehrungTab({ accounts, setAccounts, setEntries, getSaldo, getFxSa
   const isChecked = (r) => override[r.account.number] ?? r.defaultBook;
   const toBook = rows.filter(r=>r.diff && isChecked(r));
 
-  const missingStdAccounts = [FX_GAIN_ACCOUNT, FX_LOSS_ACCOUNT].filter(s=>!accounts.find(a=>a.number===s.number));
+  const missingStdAccounts = [fxStd.gain, fxStd.loss].filter(s=>!accounts.find(a=>a.number===s.number));
   const createStdAccounts = () => {
     setAccounts(p=>[...p, ...missingStdAccounts].sort((a,b)=>a.number.localeCompare(b.number)));
-    if(!gainAcc) setGainAcc(FX_GAIN_ACCOUNT.number);
-    if(!lossAcc) setLossAcc(FX_LOSS_ACCOUNT.number);
+    if(!gainAcc) setGainAcc(fxStd.gain.number);
+    if(!lossAcc) setLossAcc(fxStd.loss.number);
   };
 
   const book = () => {
@@ -2203,7 +2361,7 @@ const guessBankAccount = (accounts, st) => {
 // ═══════════════════════════════════════════════════════════════
 // TAB: BUCHUNGSASSISTENT (Claude oder lokales Modell)
 // ═══════════════════════════════════════════════════════════════
-function AssistentTab({ accounts, entries, setEntries, fxRates, year }) {
+function AssistentTab({ accounts, entries, setEntries, fxRates, year, settings }) {
   // ── Single-beleg state ──────────────────────────────────────
   const [mode,       setMode]       = useState("single"); // "single" | "bank"
   const [text,       setText]       = useState("");
@@ -2228,15 +2386,15 @@ function AssistentTab({ accounts, entries, setEntries, fxRates, year }) {
     .map(a=>`${a.number} – ${a.name} (${a.category}${a.currency&&a.currency!==CHF?`, Währung ${a.currency}`:""})`)
     .join("\n");
 
-  const systemPrompt = `Du bist ein Schweizer Vereinsbuchhalter (doppelte Buchhaltung, Schweizer Kontenrahmen).
+  const systemPrompt = `Du bist Buchhalter für «${settings.name}» (Schweiz, doppelte Buchhaltung, ${settings.chartName||"eigener Kontenplan"}).
 Verfügbare Konten:
 ${accountList}
 
 Regeln:
-- Bankkonto der Vereinskarte = Konto 1020
-- Negative Beträge = Geld fliesst aus Bankkonto heraus → Konto 1020 ist HABEN (Kredit)
-- Positive Beträge = Geld fliesst ins Bankkonto → Konto 1020 ist SOLL (Debit)
-- Bei privat vorgeschossenen Ausgaben: Haben = 2010 (Kontokorrent mahal)
+- Bankkonto = Konto 1020, sofern im Kontenplan vorhanden und nichts anderes ersichtlich
+- Negative Beträge = Geld fliesst aus dem Bankkonto heraus → Bankkonto ist HABEN (Kredit)
+- Positive Beträge = Geld fliesst ins Bankkonto → Bankkonto ist SOLL (Debit)
+- Bei privat vorgeschossenen Ausgaben: Haben = passendes Verbindlichkeits-/Kontokorrentkonto der Person (falls vorhanden)
 - Nur Kontonummern verwenden die im Kontenplan vorkommen
 - Betrag immer als positive Zahl
 - Buchwährung ist CHF: "amount" ist immer der Betrag in CHF
@@ -2353,7 +2511,7 @@ Regeln:
     const bank = accounts.find(a=>a.number===bankAcc);
     const choices = accounts.filter(a=>a.number!==bankAcc).sort((a,b)=>a.number.localeCompare(b.number));
     const hist = buildBankHistory(entries, bankAcc);
-    const system = `Du bist ein Schweizer Vereinsbuchhalter (doppelte Buchhaltung, Schweizer Kontenrahmen).
+    const system = `Du bist Buchhalter für «${settings.name}» (Schweiz, doppelte Buchhaltung, ${settings.chartName||"eigener Kontenplan"}).
 Du ordnest Transaktionen des Bankkontos ${bank.number} «${bank.name}» dem passenden GEGENKONTO zu.
 Datum, Betrag und Bankkonto stehen fest und werden nicht von dir geliefert.
 
@@ -2789,43 +2947,204 @@ Antworte NUR mit JSON, genau ein Eintrag pro Transaktion, "nr" wie oben:
 }
 
 // ═══════════════════════════════════════════════════════════════
+// TAB: EINSTELLUNGEN (Name, Kontenplan-Vorlage, Kontenplan Import/Export)
+// ═══════════════════════════════════════════════════════════════
+function EinstellungenTab({ accounts, setAccounts, entries, settings, setSettings }) {
+  const [vorlageId, setVorlageId] = useState(APP_CONFIG.defaultVorlage);
+  const [busy,  setBusy]  = useState(false);
+  const [msg,   setMsg]   = useState("");
+  const [errs,  setErrs]  = useState([]);
+
+  const setName = (v) => setSettings(p=>({ ...p, name:v }));
+  const fixName = () => { if(!String(settings.name||"").trim()) setName(DEFAULT_ORG_NAME); else setName(settings.name.trim()); };
+
+  // Neuen Kontenplan übernehmen (Vorlage oder Import) – mit Abgleich gegen bestehende Buchungen
+  const applyChart = (c, fallbackName) => {
+    setMsg(""); setErrs([]);
+    if(c.errors.length){ setErrs(c.errors); return; }
+    const m = mergeChartWithEntries(c.accounts, accounts, entries);
+    if(m.errors.length){ setErrs(m.errors); return; }
+    const name = c.name || fallbackName;
+    const lines = [`Kontenplan «${name}» mit ${c.accounts.length} Konten übernehmen?`,
+                   `Der bisherige Kontenplan (${accounts.length} Konten) wird ersetzt. Buchungen bleiben erhalten.`];
+    if(m.kept.length) lines.push("", `${m.kept.length} Konten mit Buchungen fehlen in der Vorlage und werden beibehalten:`,
+                                 m.kept.map(a=>`${a.number} ${a.name}`).join(", "));
+    if(m.changedCat.length) lines.push("", "Achtung, Kategorie ändert sich bei bebuchten Konten: "+m.changedCat.join(", "));
+    lines.push("", "Tipp: vorher im Journal ein JSON-Backup erstellen.");
+    if(!window.confirm(lines.join("\n"))) return;
+    setAccounts(m.accounts);
+    setSettings(p=>({ ...p, chartName:name,
+      fxAccounts: c.fxAccounts || { gain:FX_GAIN_ACCOUNT.number, loss:FX_LOSS_ACCOUNT.number },
+      resultAccount: c.resultAccount || DEFAULT_RESULT_ACCOUNT }));
+    setMsg(`✓ Kontenplan «${name}» übernommen (${m.accounts.length} Konten`+
+           (m.kept.length?`, davon ${m.kept.length} beibehalten`:"")+").");
+  };
+
+  const applyVorlage = async () => {
+    const v = APP_CONFIG.vorlagen.find(x=>x.id===vorlageId); if(!v) return;
+    setBusy(true); setMsg(""); setErrs([]);
+    try { applyChart(await loadChartTemplate(v), v.label); }
+    catch(err){ setErrs([err.message]); }
+    setBusy(false);
+  };
+
+  const importChart = async (e) => {
+    const f = e.target.files[0]; e.target.value = ""; if(!f) return;
+    setMsg(""); setErrs([]);
+    try {
+      const text = (await f.text()).replace(/^﻿/,"");
+      const isJson = /^\s*[\[{]/.test(text);
+      const c = normalizeChart(isJson ? JSON.parse(text) : parseChartCsv(text));
+      applyChart(c, f.name.replace(/\.[^.]+$/,""));
+    } catch(err){ setErrs([`Datei «${f.name}» nicht lesbar: ${err.message}`]); }
+  };
+
+  const sorted = () => accounts.slice().sort((a,b)=>a.number.localeCompare(b.number));
+  const exportChartJSON = () => {
+    const data = { format:"kontenplan", version:1, name:settings.chartName||"Eigener Kontenplan",
+                   fxAccounts:settings.fxAccounts, resultAccount:settings.resultAccount||DEFAULT_RESULT_ACCOUNT,
+                   exportDate:new Date().toISOString(),
+                   accounts: sorted().map(({number,name,category,group,currency})=>
+                     ({ number, name, category, group:group||"", ...(currency&&currency!==CHF?{currency}:{}) })) };
+    dlFile(JSON.stringify(data,null,2), `${fileBase(settings.name)}_Kontenplan.json`);
+  };
+  const exportChartCSV = () => {
+    const q = (v) => `"${String(v??"").replace(/"/g,'""')}"`;
+    const rows = [["Nr","Bezeichnung","Kategorie","Gruppe","Währung"],
+                  ...sorted().map(a=>[a.number,a.name,a.category,a.group||"",a.currency||CHF])];
+    dlFile(rows.map(r=>r.map(q).join(";")).join("\r\n"), `${fileBase(settings.name)}_Kontenplan.csv`);
+  };
+
+  const hint = { fontSize:12, color:"#64748B", lineHeight:1.6 };
+  const mono = { fontFamily:"'JetBrains Mono',monospace", fontSize:11.5 };
+
+  return (
+    <div style={{maxWidth:820,margin:"0 auto"}}>
+      <Card title="Name der Organisation">
+        <Field label="Verein / Firma">
+          <input type="text" value={settings.name} onChange={e=>setName(e.target.value)} onBlur={fixName}
+            placeholder={DEFAULT_ORG_NAME} style={IS}/>
+        </Field>
+        <div style={{...hint,marginTop:8}}>
+          Erscheint in der Kopfzeile, in Bilanz und Erfolgsrechnung (inkl. Word-Export), in den Dateinamen der
+          Exporte und im JSON-Backup.
+        </div>
+      </Card>
+
+      <Card title="Kontenplan-Vorlage">
+        <div style={{...hint,marginBottom:10}}>
+          Aktueller Kontenplan: <strong>{settings.chartName||"Eigener Kontenplan"}</strong> · {accounts.length} Konten
+        </div>
+        <div style={{display:"flex",gap:10,alignItems:"end",flexWrap:"wrap"}}>
+          <Field label="Vorlage" style={{flex:"1 1 280px"}}>
+            <select value={vorlageId} onChange={e=>setVorlageId(e.target.value)} style={IS}>
+              {APP_CONFIG.vorlagen.map(v=><option key={v.id} value={v.id}>{v.label}</option>)}
+            </select>
+          </Field>
+          <button onClick={applyVorlage} disabled={busy} style={{...PB,height:38,opacity:busy?.6:1}}>
+            {busy?"Lade …":"Vorlage übernehmen"}
+          </button>
+        </div>
+        <div style={{...hint,marginTop:8}}>
+          Vorlagen sind JSON-Dateien (<span style={mono}>{APP_CONFIG.vorlagen.map(v=>v.url).join(", ")}</span>) und
+          lassen sich in <span style={mono}>config.js</span> über <span style={mono}>APP_CONFIG.kontenplanVorlagen</span> anpassen.
+          Konten mit Buchungen, die in der Vorlage fehlen, bleiben erhalten.
+          {location.protocol==="file:" && <> Beim Öffnen als Datei (file://) kann der Browser Vorlagen nicht nachladen –
+            ausser der eingebauten Vereinsvorlage. Andere Vorlagen dann unten über «Kontenplan importieren» wählen.</>}
+        </div>
+      </Card>
+
+      <Card title="Kontenplan exportieren / importieren">
+        <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}}>
+          <button onClick={exportChartJSON} style={SB}>📥 Export JSON</button>
+          <button onClick={exportChartCSV}  style={SB}>📥 Export CSV</button>
+          <label style={{...PB,cursor:"pointer",display:"inline-flex",alignItems:"center"}}>
+            📤 Kontenplan importieren
+            <input type="file" accept=".json,.csv,.txt" onChange={importChart} style={{display:"none"}}/>
+          </label>
+        </div>
+        <div style={hint}>
+          Import: Kontenplan-JSON (Format wie Export bzw. <span style={mono}>kontenplaene/*.json</span>), ein JSON-Backup
+          (nur die Konten werden übernommen) oder CSV mit Kopfzeile <span style={mono}>Nr;Bezeichnung;Kategorie;Gruppe;Währung</span>.
+          Kategorie: <span style={mono}>aktiven</span>, <span style={mono}>passiven</span>, <span style={mono}>ertrag</span> oder <span style={mono}>aufwand</span>;
+          Währung nur bei Aktiven/Passiven (leer = CHF). Buchungen werden nicht verändert.
+        </div>
+      </Card>
+
+      {msg && <div style={{padding:"8px 12px",background:"#F0FDF4",borderRadius:6,color:"#15803D",fontSize:13}}>{msg}</div>}
+      {errs.length>0 && (
+        <div style={{padding:"8px 12px",background:"#FEF2F2",borderRadius:6,color:"#DC2626",fontSize:12,lineHeight:1.6}}>
+          ⚠ Kontenplan nicht übernommen:
+          <ul style={{margin:"4px 0 0 18px"}}>
+            {errs.slice(0,20).map((e,i)=><li key={i}>{e}</li>)}
+            {errs.length>20 && <li>… und {errs.length-20} weitere</li>}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════════════════════
 function App() {
   const [accounts, setAccounts] = useState(DEFAULT_ACCOUNTS);
   const [entries,  setEntries]  = useState([]);
   const [fxRates,  setFxRates]  = useState({}); // { [Jahr]: { EUR:"0.93", … } } Stichtagskurse per 31.12.
+  // Name der Organisation, Name des Kontenplans, Kursdifferenz-Konten { gain:"Nr", loss:"Nr" }
+  const [settings, setSettings] = useState({ name:APP_CONFIG.name, chartName:BUILTIN_CHART_NAME,
+                                             fxAccounts:{ gain:FX_GAIN_ACCOUNT.number, loss:FX_LOSS_ACCOUNT.number },
+                                             resultAccount:DEFAULT_RESULT_ACCOUNT });
   const [tab,      setTab]      = useState("journal");
   const [year,     setYear]     = useState(2025);
   const [loaded,   setLoaded]   = useState(false);
   const [saving,   setSaving]   = useState(false);
+  const [startMsg, setStartMsg] = useState("");
 
   // ── Load from localStorage ────────────────────────────────
   useEffect(()=>{
+    let firstRun = true;
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if(raw){
+        firstRun = false;
         const d = JSON.parse(raw);
         if(d.accounts) setAccounts(d.accounts);
         if(d.entries)  setEntries(d.entries);
         if(d.year)     setYear(d.year);
         if(d.fxRates)  setFxRates(d.fxRates);
+        if(d.settings) setSettings(p=>({ ...p, ...d.settings }));
       }
     } catch(e) { /* first run */ }
+    // Erster Start mit einer anderen Standardvorlage als der eingebauten → nachladen
+    const vorlage = APP_CONFIG.vorlagen.find(v=>v.id===APP_CONFIG.defaultVorlage);
+    if(firstRun && vorlage && vorlage.id!==BUILTIN_CHART_ID){
+      loadChartTemplate(vorlage).then(c=>{
+        if(c.errors.length) throw new Error(c.errors.join(" "));
+        setAccounts(c.accounts);
+        setSettings(p=>({ ...p, chartName:c.name||vorlage.label, fxAccounts:c.fxAccounts||p.fxAccounts,
+                                  resultAccount:c.resultAccount||DEFAULT_RESULT_ACCOUNT }));
+      }).catch(err=>setStartMsg(err.message+" Es wird der eingebaute Vereins-Kontenrahmen verwendet."))
+        .finally(()=>setLoaded(true));
+      return;
+    }
     setLoaded(true);
   },[]);
+
+  useEffect(()=>{ document.title = settings.name || DEFAULT_ORG_NAME; },[settings.name]);
 
   // ── Auto-save (debounced 600ms) ───────────────────────────
   useEffect(()=>{
     if(!loaded) return;
     setSaving(true);
     const t = setTimeout(()=>{
-      try { localStorage.setItem(STORAGE_KEY,JSON.stringify({accounts,entries,year,fxRates})); }
+      try { localStorage.setItem(STORAGE_KEY,JSON.stringify({accounts,entries,year,fxRates,settings})); }
       catch(e){ console.error("Storage error:",e); }
       setSaving(false);
     },600);
     return ()=>clearTimeout(t);
-  },[accounts,entries,year,fxRates,loaded]);
+  },[accounts,entries,year,fxRates,settings,loaded]);
 
   // ── Account saldo ─────────────────────────────────────────
   const getSaldo = useCallback((num, filterYear=null)=>{
@@ -2857,6 +3176,7 @@ function App() {
     { id:"erfolg",    label:"📊 Erfolgsrechnung" },
     { id:"fremdwaehrung", label:"💱 Fremdwährung" },
     { id:"assistent",  label:"🤖 Buchungsassistent" },
+    { id:"einstellungen", label:"⚙️ Einstellungen" },
   ];
 
   if(!loaded) return (
@@ -2892,9 +3212,9 @@ function App() {
           <div>
             <div style={{fontSize:9.5,letterSpacing:3.5,textTransform:"uppercase",
                          opacity:.5,marginBottom:2}}>
-              Doppelte Buchhaltung · Schweizer Vereins-Kontenrahmen · FJ {year}
+              Doppelte Buchhaltung · {settings.chartName||"Eigener Kontenplan"} · FJ {year}
             </div>
-            <div style={{fontSize:21,fontWeight:800,letterSpacing:-.5}}>Verein Werckmeister</div>
+            <div style={{fontSize:21,fontWeight:800,letterSpacing:-.5}}>{settings.name||DEFAULT_ORG_NAME}</div>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:14}}>
             {saving&&<span style={{fontSize:11,opacity:.45,fontStyle:"italic"}}>Speichere…</span>}
@@ -2931,22 +3251,34 @@ function App() {
 
       {/* ── Content ── */}
       <div style={{maxWidth:1200,margin:"0 auto",padding:24}}>
+        {startMsg && (
+          <div className="no-print" style={{marginBottom:14,padding:"8px 12px",background:"#FFFBEB",border:"1px solid #FDE68A",
+                       borderRadius:6,color:"#92400E",fontSize:12,display:"flex",gap:10,alignItems:"center"}}>
+            <span style={{flex:1}}>⚠ {startMsg}</span>
+            <button onClick={()=>setStartMsg("")} style={{...SB,padding:"2px 8px"}}>×</button>
+          </div>
+        )}
         {tab==="journal"    && <JournalTab    accounts={accounts} setAccounts={setAccounts}
                                                entries={entries}   setEntries={setEntries}
-                                               fxRates={fxRates}   setFxRates={setFxRates}  year={year}/>}
+                                               fxRates={fxRates}   setFxRates={setFxRates}  year={year}
+                                               settings={settings} setSettings={setSettings}/>}
         {tab==="kontenplan" && <KontenplanTab  accounts={accounts} setAccounts={setAccounts}
                                                entries={entries}   getSaldo={getSaldo}
                                                getFxSaldo={getFxSaldo} year={year}/>}
         {tab==="hauptbuch"  && <HauptbuchTab   accounts={accounts} entries={entries}         year={year}/>}
         {tab==="bilanz"     && <BilanzTab       accounts={accounts} getSaldo={getSaldo}
-                                               getFxSaldo={getFxSaldo} fxRates={fxRates}    year={year}/>}
-        {tab==="erfolg"     && <ErfolgsrechnungTab accounts={accounts} getSaldo={getSaldo}    year={year}/>}
+                                               getFxSaldo={getFxSaldo} fxRates={fxRates}    year={year}
+                                               settings={settings}/>}
+        {tab==="erfolg"     && <ErfolgsrechnungTab accounts={accounts} getSaldo={getSaldo}    year={year}
+                                               settings={settings}/>}
         {tab==="fremdwaehrung" && <FremdwaehrungTab accounts={accounts} setAccounts={setAccounts}
                                                setEntries={setEntries} getSaldo={getSaldo}
                                                getFxSaldo={getFxSaldo} fxRates={fxRates}
-                                               setFxRates={setFxRates} year={year}/>}
+                                               setFxRates={setFxRates} year={year} settings={settings}/>}
         {tab==="assistent"  && <AssistentTab accounts={accounts} entries={entries} setEntries={setEntries}
-                                               fxRates={fxRates} year={year}/>}
+                                               fxRates={fxRates} year={year} settings={settings}/>}
+        {tab==="einstellungen" && <EinstellungenTab accounts={accounts} setAccounts={setAccounts}
+                                               entries={entries} settings={settings} setSettings={setSettings}/>}
       </div>
     </div>
   );

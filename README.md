@@ -1,9 +1,18 @@
 # vereins-buchhaltung
 Eine doppelte Buchhaltung mit Kontenrahmen für Schweizer Vereine. Konten können einfach angepasst werden, Buchhaltungsassistent mit Claude für Belegsverarbeitung und CSV Import vom Kontoauszug, beispielsweise Neon Hypi Lenzburg. Pull-Requests willkommen. Super schnell, läuft alles im Browser und speichert in local storage. Backup und Import mit JSON. Einfachstes Deployment: die HTML-Datei im Browser öffnen. 
 
+Eine Schritt-für-Schritt-Anleitung (Kontenplan mit Fremdwährungen, lokales Modell, camt/CSV-Import) steht in [docs/TUTORIAL.md](docs/TUTORIAL.md).
+
 Auf der Website https://claude-buha.werckmeister.app/Werckmeister_Buchhaltung.html läuft eine Instanz. 
 
 Für die KI-Belegsverarbeitung `config.example.js` duplizieren nach `config.js` – dann den Claude-API-Key eintragen. Ist im .gitignore drin.
+
+## Name und Kontenplan
+
+Unter **⚙️ Einstellungen** werden der Name des Vereins oder der Firma (Standard «Meine Buchhaltung») und der Kontenplan verwaltet. Der Name erscheint in Kopfzeile, Bilanz, Erfolgsrechnung, Exporten und im JSON-Backup.
+
+- **Vorlagen:** Schweizer Vereins-Kontenrahmen (Standard) und Schweizer KMU-Kontenrahmen als JSON-Dateien in `kontenplaene/`. Eigene Vorlagen und die Startvorlage lassen sich in `config.js` über `window.APP_CONFIG` festlegen (siehe `config.example.js`). Vorlagen werden per `fetch()` geladen – beim Öffnen als `file://` ist nur die eingebaute Vereinsvorlage verfügbar; andere Vorlagen dann importieren oder die Seite über einen Webserver öffnen.
+- **Import/Export:** Kontenplan als JSON oder CSV (`Nr;Bezeichnung;Kategorie;Gruppe;Währung`). Konten werden beim Import geprüft; Konten mit Buchungen bleiben erhalten.
 
 ## Lokales Modell statt Claude
 

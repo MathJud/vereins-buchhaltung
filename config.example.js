@@ -27,3 +27,15 @@ window.ANTHROPIC_API_KEY = "sk-ant-DEIN-KEY-HIER";
 //   pdfMode: "auto",                        // "auto": PDF-Text extrahieren, Scans als Bild · "image": immer als Bild
 //   maxTokensFactor: 1,                     // höher (z. B. 4) bei Reasoning-Modellen mit <think>-Ausgabe
 // };
+
+// ── Name und Kontenplan-Vorlagen (optional) ──────────────────
+// window.APP_CONFIG = {
+//   name: "Meine Buchhaltung",          // Name für neue Buchhaltungen (danach unter ⚙️ Einstellungen änderbar)
+//   defaultVorlage: "verein",           // Kontenplan beim ersten Start: "verein" oder "kmu"
+//   kontenplanVorlagen: [               // ersetzt die eingebauten Vorlagen; JSON-Format siehe kontenplaene/*.json
+//     { id: "verein", label: "Schweizer Vereins-Kontenrahmen", url: "kontenplaene/verein.json" },
+//     { id: "kmu",    label: "Schweizer KMU-Kontenrahmen",     url: "kontenplaene/kmu.json"    },
+//   ],
+// };
+// Hinweis: Vorlagen werden per fetch() nachgeladen. Beim Öffnen als Datei (file://) blockiert der Browser
+// das – dann ist nur die eingebaute Vereinsvorlage verfügbar; andere Vorlagen über «Kontenplan importieren».
