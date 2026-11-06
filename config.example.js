@@ -21,7 +21,9 @@ window.ANTHROPIC_API_KEY = "sk-ant-DEIN-KEY-HIER";
 //   model:    "qwen2.5vl:7b",               // für Belegfotos ein Vision-Modell wählen
 //   apiKey:   "",                           // nur falls der Server einen Key verlangt
 //   jsonMode: true,                         // erzwingt JSON-Antworten (Ollama: true, LM Studio: false)
-//   csvBatchSize: 15,                       // CSV-Zeilen pro Aufruf (0 = alle auf einmal)
+//   jsonSchema: true,                       // Kontoauszug: JSON-Schema mit erlaubten Kontonummern (Ollama ≥ 0.5,
+//                                           //   LM Studio, llama.cpp) – verhindert erfundene Konten
+//   csvBatchSize: 15,                       // Kontoauszug-Transaktionen pro Aufruf (0 = alle auf einmal)
 //   pdfMode: "auto",                        // "auto": PDF-Text extrahieren, Scans als Bild · "image": immer als Bild
 //   maxTokensFactor: 1,                     // höher (z. B. 4) bei Reasoning-Modellen mit <think>-Ausgabe
 // };

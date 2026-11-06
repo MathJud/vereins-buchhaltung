@@ -21,9 +21,20 @@ window.LLM_CONFIG = {
 
 - **CORS:** Der Server muss Anfragen aus dem Browser erlauben – Ollama mit `OLLAMA_ORIGINS="*" ollama serve`, LM Studio mit «Enable CORS».
 - **Belege:** Für Fotos/Scans ein Vision-Modell verwenden. PDFs werden im Browser per pdf.js in Text umgewandelt; Scans ohne Textebene werden als Bild (max. 3 Seiten) gesendet.
-- **CSV-Import:** Die Transaktionen werden in Blöcken (`csvBatchSize`) analysiert. Vorschläge mit Konten, die nicht im Kontenplan stehen, werden markiert und nicht gebucht.
+- **Kontoauszug:** siehe unten. Die Transaktionen werden in Blöcken (`csvBatchSize`) analysiert; mit `jsonSchema: true` darf das Modell nur Kontonummern aus dem Kontenplan liefern.
 - Weitere Optionen siehe `config.example.js`.
 
+
+## Kontoauszug-Import (camt.053 / CSV)
+
+Im Buchungsassistenten unter «🏦 Kontoauszug»:
+
+- **Formate:** camt.053 (empfohlen), camt.052, camt.054 (ISO 20022 XML) sowie CSV der meisten Banken. Bei CSV werden Trennzeichen, Kopfzeile (auch nach Vorspann-Zeilen), Datums-/Betragsformate und Spalten wie «Betrag» oder «Belastung»/«Gutschrift» automatisch erkannt. ZIP-Archive vorher entpacken.
+- **Datum und Betrag kommen immer aus der Datei.** Die KI wählt nur das Gegenkonto und einen Buchungstext; Soll/Haben ergibt sich aus dem Vorzeichen (Eingang: Bankkonto im Soll).
+- **Sammelbuchungen** in camt werden in Einzelzahlungen aufgeteilt, sofern die Bank die Einzelbeträge mitliefert. Vorgemerkte Positionen werden ignoriert.
+- **Lernen aus dem Verlauf:** Importierte Buchungen speichern Gegenpartei und IBAN. Wurde dieselbe Gegenpartei mindestens zweimal gleich gebucht, wird sie ohne KI zugeordnet (Badge «Verlauf»); sonst erhält das Modell die früheren Konten als Hinweis.
+- **Duplikate:** Bereits importierte Transaktionen werden erkannt und nicht nochmals gebucht.
+- **Fremdwährung:** Ein EUR-Auszug wird auf ein EUR-Konto gebucht; der CHF-Betrag ergibt sich aus dem eingegebenen Kurs (vorbelegt mit dem Stichtagskurs des Jahres).
 
 ## Fremdwährungskonten
 

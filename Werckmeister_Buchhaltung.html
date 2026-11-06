@@ -35,6 +35,7 @@
         model:   c.model || (provider==="openai" ? "qwen2.5vl:7b" : "claude-sonnet-4-20250514"),
         apiKey:  c.apiKey || (provider==="anthropic" ? (window.ANTHROPIC_API_KEY || "") : ""),
         jsonMode: !!c.jsonMode,                     // response_format json_object (Ollama: ja, LM Studio: nein)
+        jsonSchema: !!c.jsonSchema,                 // response_format json_schema: Kontonummern als enum erzwingen
         csvBatchSize: Number(c.csvBatchSize) || (provider==="openai" ? 15 : 0), // 0 = alle Zeilen in einem Aufruf
         pdfMode: c.pdfMode === "image" ? "image" : "auto", // auto: Text extrahieren, Scan → Bild
         maxTokensFactor: Number(c.maxTokensFactor) || 1,   // z. B. 4 für Reasoning-Modelle
@@ -150,6 +151,8 @@ const normalizeEntry = (raw, accounts) => {
   if(error) return { error };
   const base = { id:raw.id, date:raw.date, description:raw.description, reference:raw.reference||"",
                  debit:raw.debit, credit:raw.credit, amount:amt };
+  // Herkunft aus dem Kontoauszug-Import (Duplikaterkennung, Lernen der Gegenkonten)
+  for(const k of ["importId","bankCp","bankIban"]) if(raw[k]) base[k] = raw[k];
   if(!currency) return { entry:base };
   if(raw.fxReval) return { entry:{ ...base, fxCurrency:currency, fxAmount:0, fxReval:true } };
   const fx = round2(parseNum(raw.fxAmount));
@@ -1877,7 +1880,7 @@ const apiErrorText = (data, status) => {
   return (typeof e==="string" ? e : e?.message) || `HTTP ${status}`;
 };
 
-const callLLM = async ({ system, parts, maxTokens }) => {
+const callLLM = async ({ system, parts, maxTokens, schema }) => {
   const C = LLM_CONFIG;
   const max_tokens = Math.round(maxTokens * C.maxTokensFactor);
   const TRUNC = "Antwort abgeschnitten (max_tokens erreicht) – in config.js csvBatchSize verkleinern oder maxTokensFactor erhöhen.";
@@ -1913,7 +1916,8 @@ const callLLM = async ({ system, parts, maxTokens }) => {
     messages:[ { role:"system", content:system },
                { role:"user", content: onlyText ? content.map(c=>c.text).join("\n\n") : content } ],
   };
-  if(C.jsonMode) body.response_format = { type:"json_object" };
+  if(schema && C.jsonSchema) body.response_format = { type:"json_schema", json_schema:{ name:"antwort", strict:true, schema } };
+  else if(C.jsonMode) body.response_format = { type:"json_object" };
   try {
     res = await fetch(`${C.baseUrl}/chat/completions`, {
       method:"POST",
@@ -1954,11 +1958,254 @@ const checkSuggestionAccounts = (s, accounts) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// KONTOAUSZUG-IMPORT: camt.053 / .052 / .054 (ISO 20022) und CSV
+// ═══════════════════════════════════════════════════════════════
+// Alle Parser liefern dieselbe Struktur. Datum und Betrag stammen IMMER aus der Datei –
+// die KI wählt später nur das Gegenkonto und einen Buchungstext.
+//   Transaktion: { key, date:"YYYY-MM-DD", amount:±Zahl in Kontowährung, currency,
+//                  counterparty, iban, text, reference, bankRef, origAmount, origCurrency }
+//   Auszug:      { format, iban, currency, txs, info:[…] }
+
+const toIsoDate = (s) => {
+  const v = String(s||"").trim();
+  let m = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = v.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})\b/);
+  if(m) return `${m[3].length===2?"20"+m[3]:m[3]}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`;
+  return "";
+};
+
+// Beträge aus Bank-CSVs: 1'234.50 · 1.234,50 · -12,30 · 12.30- · (12.30) · CHF 12.30
+const parseAmount = (v) => {
+  let s = String(v??"").replace(/[\s'’ ]/g,"").replace(/^[A-Za-z]{3}/,"").replace(/[A-Za-z]{3}$/,"");
+  if(!s) return NaN;
+  let neg = false;
+  if(/^\(.*\)$/.test(s)){ neg = true; s = s.slice(1,-1); }
+  if(/-$/.test(s)){ neg = true; s = s.slice(0,-1); }
+  s = s.replace(/^\+/,"");
+  const lc = s.lastIndexOf(","), ld = s.lastIndexOf(".");
+  if(lc>=0 && ld>=0) s = lc>ld ? s.replace(/\./g,"").replace(",",".") : s.replace(/,/g,"");
+  else if(lc>=0) s = (s.match(/,/g).length>1) ? s.replace(/,/g,"") : s.replace(",",".");
+  if(!/^-?\d+(\.\d+)?$/.test(s)) return NaN;
+  const n = parseFloat(s);
+  return neg ? -Math.abs(n) : n;
+};
+
+// Eindeutige Schlüssel für die Duplikaterkennung (gleiche Datei zweimal importiert)
+const withImportKeys = (txs, prefix) => {
+  const seen = {};
+  return txs.map(t=>{
+    const base = `${prefix}|${t.date}|${t.amount.toFixed(2)}|${t.bankRef || (t.counterparty+"|"+t.text).slice(0,80)}`;
+    const n = seen[base] = (seen[base]||0)+1;
+    return { ...t, key: n>1 ? `${base}#${n}` : base };
+  });
+};
+
+// ── camt (XML) ──────────────────────────────────────────────────
+// Namespace-unabhängig (camt.053.001.02 … .08): Elemente nur über localName suchen
+const xKids = (el, name) => el ? [...el.children].filter(c=>c.localName===name) : [];
+const xKid  = (el, ...path) => path.reduce((e,n)=>e ? [...e.children].find(c=>c.localName===n)||null : null, el||null);
+const xTxt  = (el, ...path) => (xKid(el,...path)?.textContent||"").replace(/\s+/g," ").trim();
+
+const parseCamt = (xml) => {
+  const doc = new DOMParser().parseFromString(xml, "application/xml");
+  if(doc.getElementsByTagName("parsererror").length) throw new Error("XML-Datei ist nicht lesbar.");
+  const msg  = [...doc.documentElement.children][0];
+  const kind = { BkToCstmrStmt:["Stmt","camt.053"], BkToCstmrAcctRpt:["Rpt","camt.052"],
+                 BkToCstmrDbtCdtNtfctn:["Ntfctn","camt.054"] }[msg?.localName];
+  if(!kind) throw new Error("Keine camt.052/053/054-Datei (ISO 20022) erkannt.");
+  const stmts = xKids(msg, kind[0]);
+  const ibans = [...new Set(stmts.map(s=>xTxt(s,"Acct","Id","IBAN")||xTxt(s,"Acct","Id","Othr","Id")))];
+  if(ibans.length>1)
+    throw new Error(`Datei enthält ${ibans.length} Konten (${ibans.join(", ")}) – bitte pro Konto einzeln exportieren.`);
+  const iban = ibans[0]||"";
+  const dir  = (el, fallback) => { const c = xTxt(el,"CdtDbtInd"); return c==="DBIT" ? -1 : c==="CRDT" ? 1 : fallback; };
+  const txs = [];
+  let split = 0, skipped = 0;
+
+  for(const st of stmts){
+    const acctCcy = xTxt(st,"Acct","Ccy");
+    for(const n of xKids(st,"Ntry")){
+      const sts = xTxt(n,"Sts");
+      if(sts && sts!=="BOOK"){ skipped++; continue; }           // vorgemerkte/Info-Buchungen
+      const amtEl = xKid(n,"Amt");
+      const currency = amtEl?.getAttribute("Ccy") || acctCcy || CHF;
+      const sign = dir(n, 1);
+      const amt  = parseFloat(amtEl?.textContent);
+      if(isNaN(amt)) continue;
+      const date = toIsoDate(xTxt(n,"BookgDt","Dt") || xTxt(n,"BookgDt","DtTm") || xTxt(n,"ValDt","Dt"));
+      const nRef = xTxt(n,"AcctSvcrRef") || xTxt(n,"NtryRef");
+      const addl = xTxt(n,"AddtlNtryInf");
+      const tds  = xKids(n,"NtryDtls").flatMap(d=>xKids(d,"TxDtls"));
+      const tdAmt = td => parseFloat(xKid(td,"Amt")?.textContent ?? xKid(td,"AmtDtls","TxAmt","Amt")?.textContent);
+      // Sammelbuchung aufteilen, wenn die Einzelbeträge vollständig sind und aufgehen
+      const canSplit = tds.length>1 && tds.every(td=>!isNaN(tdAmt(td))) &&
+        Math.abs(tds.reduce((s,td)=>s+dir(td,sign)*tdAmt(td),0) - sign*amt) < 0.005;
+      if(canSplit) split++;
+      const parts = canSplit ? tds : [tds.length===1 ? tds[0] : null];
+
+      parts.forEach((td,i)=>{
+        const s  = canSplit ? dir(td,sign) : sign;
+        const a  = canSplit ? tdAmt(td) : amt;
+        const p  = s>0 ? "Dbtr" : "Cdtr";                     // Eingang: Zahler · Ausgang: Empfänger
+        const rp = xKid(td,"RltdPties");
+        const counterparty = xTxt(rp,p,"Nm") || xTxt(rp,p,"Pty","Nm") ||
+                             xTxt(rp,"Ultmt"+p,"Nm") || xTxt(rp,"Ultmt"+p,"Pty","Nm");
+        const rmt   = xKid(td,"RmtInf");
+        const ustrd = xKids(rmt,"Ustrd").map(e=>e.textContent.trim()).join(" ");
+        const e2e   = xTxt(td,"Refs","EndToEndId");
+        const instd = xKid(td,"AmtDtls","InstdAmt","Amt");
+        const instdCcy = instd?.getAttribute("Ccy");
+        const tRef  = xTxt(td,"Refs","AcctSvcrRef");
+        txs.push({
+          date, amount: s*Math.abs(a), currency, counterparty,
+          iban: xTxt(rp,p+"Acct","Id","IBAN"),
+          text: [...new Set([ustrd, xTxt(td,"AddtlTxInf"), canSplit && i>0 ? "" : addl].filter(Boolean))].join(" · "),
+          reference: xTxt(rmt,"Strd","CdtrRefInf","Ref") || (e2e && e2e!=="NOTPROVIDED" ? e2e : ""),
+          bankRef: tRef || (nRef ? `${nRef}/${i}` : ""),
+          origAmount:   instd && instdCcy && instdCcy!==currency ? Math.abs(parseFloat(instd.textContent)) : null,
+          origCurrency: instd && instdCcy && instdCcy!==currency ? instdCcy : null,
+        });
+      });
+    }
+  }
+  const info = [];
+  if(split)   info.push(`${split} Sammelbuchung${split>1?"en":""} in Einzelzahlungen aufgeteilt`);
+  if(skipped) info.push(`${skipped} nicht gebuchte (vorgemerkte) Positionen ignoriert`);
+  const currencies = [...new Set(txs.map(t=>t.currency))];
+  if(currencies.length>1) throw new Error(`Auszug enthält mehrere Währungen (${currencies.join(", ")}).`);
+  return { format:kind[1], iban, currency: currencies[0] || xTxt(stmts[0],"Acct","Ccy") || CHF,
+           txs: withImportKeys(txs, iban||kind[1]), info };
+};
+
+// ── CSV ─────────────────────────────────────────────────────────
+// Spalten werden über bekannte Bezeichnungen erkannt (neon, PostFinance, UBS, Raiffeisen,
+// ZKB, Revolut …). Vorspann-Zeilen vor der Kopfzeile werden übersprungen.
+const CSV_COLS = {
+  date:     ["date","datum","buchungsdatum","buchungstag","booking date","transaktionsdatum","abschlussdatum",
+             "started date","completed date","valuta","valutadatum","value date"],
+  amount:   ["amount","betrag","betrag chf","transaktionsbetrag","umsatz","einzelbetrag"],
+  debit:    ["belastung","belastung chf","lastschrift","debit","soll","ausgang"],
+  credit:   ["gutschrift","gutschrift chf","credit","haben","eingang"],
+  currency: ["currency","währung","waehrung","whg","ccy"],
+  party:    ["name","gegenpartei","empfänger","auftraggeber","begünstigter","zahlungsempfänger","payee",
+             "merchant","counterparty"],
+  iban:     ["iban","gegenkonto iban","konto gegenpartei","iban gegenpartei"],
+  text:     ["description","buchungstext","beschreibung","text","details","avisierungstext","mitteilung",
+             "mitteilungen","subject","verwendungszweck","zahlungszweck","beschreibung1","beschreibung2",
+             "beschreibung3","category","kategorie"],
+};
+const normHeader = h => h.replace(/^﻿/,"").toLowerCase().replace(/\(.*?\)/g,"")
+                         .replace(/[^a-z0-9äöüéèà ]/g," ").replace(/\s+/g," ").trim();
+
+const splitCsvLine = (line, sep) => {
+  const out = []; let cur = "", q = false;
+  for(let i=0; i<line.length; i++){
+    const ch = line[i];
+    if(q){ if(ch==='"'){ if(line[i+1]==='"'){ cur+='"'; i++; } else q = false; } else cur += ch; }
+    else if(ch==='"') q = true;
+    else if(ch===sep){ out.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out.map(s=>s.trim());
+};
+
+const parseBankCsv = (text) => {
+  const lines = text.split(/\r?\n/).filter(l=>l.trim());
+  for(const sep of [";", ",", "\t"]){
+    for(let h=0; h<Math.min(lines.length,40); h++){
+      const head = splitCsvLine(lines[h], sep).map(normHeader);
+      // exakt oder als Präfix («Gutschrift in CHF», «Betrag CHF»); Reihenfolge der Aliase = Priorität
+      const hit = (h,a) => h===a || h.startsWith(a+" ");
+      const col = k => CSV_COLS[k].map(a=>head.findIndex(h=>hit(h,a))).find(i=>i>=0) ?? -1;
+      const c = { date:col("date"), amount:col("amount"), debit:col("debit"), credit:col("credit"),
+                  currency:col("currency"), party:col("party"), iban:col("iban") };
+      if(c.date<0 || (c.amount<0 && c.debit<0 && c.credit<0)) continue;
+      const textCols = head.map((h,i)=>i).filter(i=>CSV_COLS.text.some(a=>hit(head[i],a)) && i!==c.party);
+      const txs = [];
+      for(const line of lines.slice(h+1)){
+        const v = splitCsvLine(line, sep);
+        const date = toIsoDate(v[c.date]);
+        let amount;
+        if(c.amount>=0) amount = parseAmount(v[c.amount]);
+        else {
+          const cr = Math.abs(parseAmount(v[c.credit])||0), db = Math.abs(parseAmount(v[c.debit])||0);
+          amount = cr||db ? round2(cr-db) : NaN;
+        }
+        if(!date || isNaN(amount) || amount===0) continue;   // Summen-, Saldo- und Leerzeilen
+        const texts = [...new Set(textCols.map(i=>v[i]).filter(Boolean))];
+        txs.push({ date, amount, currency: (c.currency>=0 && v[c.currency]) ? v[c.currency].toUpperCase() : CHF,
+                   counterparty: c.party>=0 ? v[c.party] : (texts[0]||""),
+                   iban: c.iban>=0 ? v[c.iban].replace(/\s/g,"") : "",
+                   text: (c.party>=0 ? texts : texts.slice(1)).join(" · "),
+                   reference:"", bankRef:"", origAmount:null, origCurrency:null });
+      }
+      const currencies = [...new Set(txs.map(t=>t.currency))];
+      if(currencies.length>1) throw new Error(`CSV enthält mehrere Währungen (${currencies.join(", ")}) – bitte pro Währung exportieren.`);
+      return { format:"CSV", iban:"", currency: currencies[0]||CHF, txs: withImportKeys(txs,"csv"), info:[] };
+    }
+  }
+  throw new Error("CSV-Kopfzeile nicht erkannt – benötigt mindestens eine Datums- und eine Betragsspalte "+
+                  "(z. B. «Datum» und «Betrag» oder «Belastung»/«Gutschrift»).");
+};
+
+// Bankdateien kommen als UTF-8 oder Windows-1252
+const decodeBankFile = (buf) => {
+  try { return new TextDecoder("utf-8", { fatal:true }).decode(buf); }
+  catch { return new TextDecoder("windows-1252").decode(buf); }
+};
+const parseStatement = (text) => text.trimStart().startsWith("<") ? parseCamt(text) : parseBankCsv(text);
+
+// ── Lernen aus früheren Buchungen ───────────────────────────────
+// Importierte Buchungen tragen bankCp/bankIban. Gleiche Gegenpartei + gleiche Richtung
+// → bisheriges Gegenkonto. Eindeutige Fälle werden ohne KI zugeordnet.
+const cpKey = s => String(s||"").toLowerCase().replace(/[^a-z0-9äöüàéè]+/g," ").trim();
+const histKeys = (dirSign, iban, cp) =>
+  [iban && `${dirSign}|iban:${iban}`, cpKey(cp) && `${dirSign}|cp:${cpKey(cp)}`].filter(Boolean);
+
+const buildBankHistory = (entries, bankAcc) => {
+  const m = new Map();
+  for(const e of entries){
+    if(!e.bankCp && !e.bankIban) continue;
+    const inc = e.debit===bankAcc;
+    const other = inc ? e.credit : e.credit===bankAcc ? e.debit : null;
+    if(!other) continue;
+    for(const k of histKeys(inc?"+":"-", e.bankIban, e.bankCp)){
+      const c = m.get(k) || {}; c[other] = (c[other]||0)+1; m.set(k,c);
+    }
+  }
+  return m;
+};
+// → [[konto, anzahl], …] absteigend
+const historyFor = (hist, tx) => {
+  for(const k of histKeys(tx.amount>0?"+":"-", tx.iban, tx.counterparty)){
+    const c = hist.get(k);
+    if(c) return Object.entries(c).sort((a,b)=>b[1]-a[1]);
+  }
+  return [];
+};
+
+const BANK_MAP_KEY = "werckmeister_bank_map";   // IBAN → Kontonummer (nur Komfort, pro Browser)
+const loadBankMap = () => { try { return JSON.parse(localStorage.getItem(BANK_MAP_KEY)||"{}"); } catch { return {}; } };
+const saveBankMap = (iban, acc) => {
+  if(!iban) return;
+  try { localStorage.setItem(BANK_MAP_KEY, JSON.stringify({ ...loadBankMap(), [iban]:acc })); } catch {}
+};
+const guessBankAccount = (accounts, st) => {
+  const mapped = loadBankMap()[st.iban];
+  if(mapped && accounts.some(a=>a.number===mapped)) return mapped;
+  const liquid = accounts.filter(a=>a.category==="aktiven" && a.number.startsWith("10") && (a.currency||CHF)===st.currency)
+                         .sort((a,b)=>a.number.localeCompare(b.number));
+  return (st.currency===CHF && liquid.find(a=>a.number==="1020")?.number) || liquid[0]?.number || "";
+};
+
+// ═══════════════════════════════════════════════════════════════
 // TAB: BUCHUNGSASSISTENT (Claude oder lokales Modell)
 // ═══════════════════════════════════════════════════════════════
-function AssistentTab({ accounts, setEntries, year }) {
+function AssistentTab({ accounts, entries, setEntries, fxRates, year }) {
   // ── Single-beleg state ──────────────────────────────────────
-  const [mode,       setMode]       = useState("single"); // "single" | "csv"
+  const [mode,       setMode]       = useState("single"); // "single" | "bank"
   const [text,       setText]       = useState("");
   const [file,       setFile]       = useState(null);
   const [fileB64,    setFileB64]    = useState(null);
@@ -1969,13 +2216,13 @@ function AssistentTab({ accounts, setEntries, year }) {
   const [booked,     setBooked]     = useState(false);
   const [error,      setError]      = useState("");
 
-  // ── CSV state ──────────────────────────────────────────────
-  const [csvRows,    setCsvRows]    = useState([]); // parsed raw rows
-  const [csvResults, setCsvResults] = useState([]); // [{...row, suggestion, selected, booked}]
-  const [csvLoading, setCsvLoading] = useState(false);
-  const [csvDone,    setCsvDone]    = useState(false);
-  const [csvProgress,setCsvProgress]= useState("");
-
+  // ── Kontoauszug state ───────────────────────────────────────
+  const [stmt,       setStmt]       = useState(null); // { format, iban, currency, info, fileName }
+  const [rows,       setRows]       = useState([]);   // [{...tx, konto, text, why, source, selected, booked, dup, error}]
+  const [bankAcc,    setBankAcc]    = useState("");
+  const [rate,       setRate]       = useState("");   // CHF je 1 Fremdwährung (nur Fremdwährungsauszüge)
+  const [stLoading,  setStLoading]  = useState(false);
+  const [stProgress, setStProgress] = useState("");
   const accountList = accounts
     .sort((a,b)=>a.number.localeCompare(b.number))
     .map(a=>`${a.number} – ${a.name} (${a.category}${a.currency&&a.currency!==CHF?`, Währung ${a.currency}`:""})`)
@@ -2061,97 +2308,169 @@ Regeln:
 
   const resetSingle = () => { setText(""); removeFile(); setSuggestion(null); setBooked(false); setError(""); };
 
-  // ── CSV handlers ────────────────────────────────────────────
-  const handleCsv = (e) => {
-    const f = e.target.files[0]; if(!f) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      const lines = ev.target.result.split(/\r?\n/).filter(Boolean);
-      const header = lines[0].split(";").map(h=>h.replace(/"/g,"").trim());
-      const rows = lines.slice(1).map(line=>{
-        const cols = line.split(";").map(c=>c.replace(/"/g,"").trim());
-        const obj = {};
-        header.forEach((h,i)=>{ obj[h]=cols[i]||""; });
-        return obj;
-      }).filter(r=>r.Date&&r.Amount&&r.Amount!=="");
-      setCsvRows(rows);
-      setCsvResults(rows.map(r=>({...r,suggestion:null,selected:true,booked:false,error:""})));
-      setCsvDone(false);
-    };
-    reader.readAsText(f,"utf-8");
-    e.target.value="";
+  // ── Kontoauszug handlers ────────────────────────────────────
+  // Datum, Betrag und Bankkonto kommen aus der Datei bzw. der Auswahl – die KI wählt nur das Gegenkonto.
+  const defaultText = r => (r.counterparty || r.text || "Bankbuchung").slice(0,60);
+
+  // Eindeutige frühere Zuordnungen (≥2×, ≥80 %) direkt übernehmen
+  const applyHistory = (list, acc) => {
+    const hist = buildBankHistory(entries, acc);
+    return list.map(r=>{
+      if(r.booked || r.dup || r.source==="ki" || r.source==="manuell") return r;
+      const h = historyFor(hist, r);
+      const total = h.reduce((s,[,n])=>s+n,0);
+      const [konto, n] = h[0] || [];
+      if(konto && konto!==acc && n>=2 && n/total>=0.8 && accounts.some(a=>a.number===konto))
+        return { ...r, konto, text: r.text || defaultText(r),
+                 why:`Bisher ${n}× auf ${konto} gebucht`, source:"verlauf" };
+      return r.source==="verlauf" ? { ...r, konto:"", why:"", source:"" } : r;
+    });
   };
 
-  const analyseCsv = async () => {
-    if(!csvRows.length) return;
-    setCsvLoading(true); setError("");
-    // Zeilen blockweise senden (lokale Modelle haben kleine Kontextfenster); 0 = alles in einem Aufruf
-    const size = LLM_CONFIG.csvBatchSize > 0 ? LLM_CONFIG.csvBatchSize : csvRows.length;
+  const handleStatement = async (e) => {
+    const f = e.target.files[0]; e.target.value = ""; if(!f) return;
+    setError("");
+    try {
+      const st = parseStatement(decodeBankFile(await f.arrayBuffer()));
+      if(!st.txs.length) throw new Error("Keine gebuchten Transaktionen in der Datei gefunden.");
+      const acc  = guessBankAccount(accounts, st);
+      const done = new Set(entries.map(x=>x.importId).filter(Boolean));
+      setStmt({ format:st.format, iban:st.iban, currency:st.currency, info:st.info, fileName:f.name });
+      setBankAcc(acc);
+      setRate(st.currency!==CHF ? String(fxRates?.[year]?.[st.currency]||"") : "");
+      setRows(applyHistory(st.txs.map(t=>({ ...t, bankText:t.text, konto:"", text:"", why:"", source:"",
+        dup:done.has(t.key), selected:!done.has(t.key), booked:done.has(t.key), error:"" })), acc));
+    } catch(err){ setError(err.message); }
+  };
+
+  const changeBankAcc = (acc) => { setBankAcc(acc); setRows(prev=>applyHistory(prev, acc)); };
+  const resetStatement = () => { setStmt(null); setRows([]); setError(""); setStProgress(""); };
+
+  const analyseStatement = async () => {
+    const todo = rows.map((r,i)=>({ r, i })).filter(({r})=>!r.konto && !r.booked);
+    if(!todo.length || !bankAcc) return;
+    setStLoading(true); setError("");
+    const bank = accounts.find(a=>a.number===bankAcc);
+    const choices = accounts.filter(a=>a.number!==bankAcc).sort((a,b)=>a.number.localeCompare(b.number));
+    const hist = buildBankHistory(entries, bankAcc);
+    const system = `Du bist ein Schweizer Vereinsbuchhalter (doppelte Buchhaltung, Schweizer Kontenrahmen).
+Du ordnest Transaktionen des Bankkontos ${bank.number} «${bank.name}» dem passenden GEGENKONTO zu.
+Datum, Betrag und Bankkonto stehen fest und werden nicht von dir geliefert.
+
+Mögliche Gegenkonten:
+${choices.map(a=>`${a.number} – ${a.name} (${a.category}${a.currency&&a.currency!==CHF?`, Währung ${a.currency}`:""})`).join("\n")}
+
+Regeln:
+- EINGANG = Geld kommt aufs Bankkonto (z. B. Mitgliederbeiträge, Spenden, Erträge, Zahlungen von Debitoren, Darlehen)
+- AUSGANG = Geld verlässt das Bankkonto (z. B. Aufwand, Zahlungen an Kreditoren, Rückzahlungen)
+- Überträge zwischen eigenen Konten → das andere Konto der flüssigen Mittel
+- Bankspesen und Kontoführungsgebühren → passendes Aufwandkonto für Bankspesen/Finanzaufwand
+- «Früher gebucht auf» ist ein starker Hinweis, wenn er zur Transaktion passt
+- Nur Kontonummern aus der Liste verwenden
+- "text": kurzer Buchungstext auf Deutsch (max. 60 Zeichen)
+- Kein Markdown, nur reines JSON`;
+    const schema = { type:"object", additionalProperties:false, required:["zuordnungen"], properties:{
+      zuordnungen:{ type:"array", items:{ type:"object", additionalProperties:false,
+        required:["nr","konto","text","begruendung"],
+        properties:{ nr:{type:"integer"}, konto:{type:"string", enum:choices.map(a=>a.number)},
+                     text:{type:"string"}, begruendung:{type:"string"} } } } } };
+
+    const size = LLM_CONFIG.csvBatchSize > 0 ? LLM_CONFIG.csvBatchSize : todo.length;
     const batches = [];
-    for(let i=0; i<csvRows.length; i+=size) batches.push({ start:i, rows:csvRows.slice(i,i+size) });
+    for(let i=0; i<todo.length; i+=size) batches.push(todo.slice(i,i+size));
     const errors = [];
+    const patch = (idx, fn) => setRows(prev=>prev.map((r,j)=>idx.includes(j) ? fn(r,j) : r));
 
     for(let b=0; b<batches.length; b++){
-      const { start, rows } = batches[b];
-      setCsvProgress(batches.length>1 ? `Block ${b+1}/${batches.length}` : "");
-      const rowsText = rows.map((r,i)=>
-        `${i+1}. Datum: ${r.Date}, Betrag: ${r.Amount} CHF, Beschreibung: "${r.Description||""}", Verwendungszweck: "${r.Subject||""}", Kategorie: "${r.Category||""}"`
-      ).join("\n");
-      const prompt = `Analysiere diese ${rows.length} Banktransaktionen vom Vereinskonto (Konto 1020 Bankkonto) und schlage für jede eine doppelte Buchung vor.
+      const batch = batches[b];
+      setStProgress(batches.length>1 ? `Block ${b+1}/${batches.length}` : "");
+      const lines = batch.map(({r},k)=>{
+        const h = historyFor(hist, r).slice(0,2).map(([a,n])=>`${a} (${n}×)`).join(", ");
+        return `${k+1}. ${r.amount>0?"EINGANG":"AUSGANG"} ${r.currency} ${fmt(Math.abs(r.amount))} · ${r.date}`+
+               ` · Gegenpartei: ${r.counterparty||"—"}`+
+               (r.bankText ? ` · Text: ${r.bankText.slice(0,300)}` : "")+
+               (r.reference ? ` · Referenz: ${r.reference}` : "")+
+               (h ? ` · Früher gebucht auf: ${h}` : "");
+      }).join("\n");
+      const prompt = `Ordne diese ${batch.length} Transaktionen zu.
 
-Transaktionen:
-${rowsText}
+${lines}
 
-Antworte NUR mit einem JSON-Objekt mit dem Array "buchungen", genau ein Objekt pro Transaktion in derselben Reihenfolge:
-{"buchungen":[{"date":"YYYY-MM-DD","description":"kurzer Buchungstext","reference":"","debit":"NNNN","credit":"NNNN","amount":0.00,"reasoning":"kurze Begründung"}]}`;
+Antworte NUR mit JSON, genau ein Eintrag pro Transaktion, "nr" wie oben:
+{"zuordnungen":[{"nr":1,"konto":"NNNN","text":"kurzer Buchungstext","begruendung":"kurz"}]}`;
+      const idx = batch.map(x=>x.i);
       try {
-        const raw = await callLLM({ system: systemPrompt, parts:[{ type:"text", text:prompt }],
-                                    maxTokens: Math.max(1000, rows.length*200) });
+        const raw = await callLLM({ system, parts:[{ type:"text", text:prompt }], schema,
+                                    maxTokens: Math.max(800, batch.length*150) });
         const parsed = parseLLMJson(raw);
-        const list = Array.isArray(parsed) ? parsed : (parsed.buchungen || parsed.entries || []);
-        if(!Array.isArray(list) || !list.length) throw new Error("Antwort enthält keine Buchungen");
-        const lenErr = list.length!==rows.length
-          ? `Modell lieferte ${list.length} statt ${rows.length} Buchungen – Zuordnung prüfen` : "";
-        setCsvResults(prev=>prev.map((r,i)=>{
-          if(i<start || i>=start+rows.length) return r;
-          const s = prepFx(list[i-start]);
-          const err = s ? checkSuggestionAccounts(s, accounts) : "Keine Buchung vorgeschlagen";
-          return { ...r, suggestion:s, error: err || lenErr };
-        }));
-        if(lenErr) errors.push(`Block ${b+1}: ${lenErr}`);
+        const list = Array.isArray(parsed) ? parsed : (parsed.zuordnungen || parsed.buchungen || []);
+        if(!Array.isArray(list) || !list.length) throw new Error("Antwort enthält keine Zuordnungen");
+        // Zuordnung über "nr"; fehlt sie, nach Reihenfolge
+        const byNr = new Map();
+        list.forEach((x,k)=>{ const nr = parseInt(x?.nr); byNr.set(nr>0 ? nr : k+1, x); });
+        patch(idx, (r,j)=>{
+          const x = byNr.get(idx.indexOf(j)+1);
+          if(!x) return { ...r, error:"Modell hat diese Transaktion ausgelassen – Gegenkonto bitte wählen" };
+          const konto = String(x.konto ?? x.account ?? "").trim();
+          const text  = String(x.text ?? x.description ?? "").trim().slice(0,80) || defaultText(r);
+          const ok    = accounts.some(a=>a.number===konto) && konto!==bankAcc;
+          return { ...r, konto: ok ? konto : "", text, why: String(x.begruendung ?? x.reasoning ?? ""),
+                   source: ok ? "ki" : "", error: ok ? "" : `Vorgeschlagenes Konto «${konto||"—"}» ist ungültig – bitte wählen` };
+        });
       } catch(err){
         errors.push(`Block ${b+1}: ${err.message}`);
-        setCsvResults(prev=>prev.map((r,i)=> i>=start && i<start+rows.length ? { ...r, error:err.message } : r));
+        patch(idx, r=>({ ...r, error:err.message }));
       }
     }
-    if(errors.length) setError("CSV-Analyse: "+errors.join(" · "));
-    setCsvProgress("");
-    setCsvDone(true);
-    setCsvLoading(false);
+    if(errors.length) setError("Analyse: "+errors.join(" · "));
+    setStProgress("");
+    setStLoading(false);
   };
 
-  const bookSelected = () => {
-    const results = csvResults.map(r=>
-      r.selected&&r.suggestion&&!r.booked
-        ? (checkSuggestionAccounts(r.suggestion, accounts)
-            ? { r, error: checkSuggestionAccounts(r.suggestion, accounts) }
-            : { r, ...normalizeEntry(r.suggestion, accounts) })
-        : { r });
-    const newEntries = results.filter(x=>x.entry).map(x=>({ ...x.entry, id: Date.now()+Math.random() }));
-    setEntries(p=>[...p,...newEntries]);
-    setCsvResults(results.map(x=>
-      x.entry ? {...x.r,booked:true,error:""} : x.error ? {...x.r,error:x.error} : x.r));
+  const bankAccount = accounts.find(a=>a.number===bankAcc);
+  const bankCur     = bankAccount?.currency || CHF;
+  const ccyMismatch = !!(stmt && bankAccount && bankCur!==stmt.currency);
+  const rateNum     = parseNum(rate);
+
+  // Buchung aus Transaktion: Bankkonto im Soll bei Eingang, im Haben bei Ausgang
+  const statementEntry = (r) => {
+    const abs = round2(Math.abs(r.amount));
+    let amount = abs, fxAmount = "";
+    if(bankCur!==CHF){
+      if(!(rateNum>0)) return { error:`Kurs CHF je 1 ${bankCur} fehlt` };
+      amount = round2(abs*rateNum); fxAmount = abs;
+    } else if(accCurrency(accounts, r.konto)!==CHF && r.origCurrency===accCurrency(accounts, r.konto)){
+      fxAmount = r.origAmount;   // CHF-Zahlung auf Fremdwährungskonto: Originalbetrag aus camt
+    }
+    const inc = r.amount>0;
+    return normalizeEntry({ date:r.date, description:r.text || defaultText(r), reference:"",
+      debit: inc ? bankAcc : r.konto, credit: inc ? r.konto : bankAcc, amount, fxAmount,
+      importId:r.key, bankCp:r.counterparty, bankIban:r.iban }, accounts);
   };
 
-  const toggleRow = (i) => setCsvResults(prev=>prev.map((r,j)=>j===i?{...r,selected:!r.selected}:r));
-  const toggleAll = (v) => setCsvResults(prev=>prev.map(r=>({...r,selected:v})));
-  const updateSugg = (i,k,v) => setCsvResults(prev=>prev.map((r,j)=>j===i?{...r,suggestion:{...r.suggestion,[k]:v}}:r));
+  const bookStatement = () => {
+    const newEntries = [];
+    const next = rows.map(r=>{
+      if(!r.selected || r.booked || !r.konto) return r;
+      if(r.konto===bankAcc) return { ...r, error:"Gegenkonto = Bankkonto" };
+      const { entry, error } = statementEntry(r);
+      if(error) return { ...r, error };
+      newEntries.push({ ...entry, id:Date.now()+Math.random() });
+      return { ...r, booked:true, error:"" };
+    });
+    if(newEntries.length){ setEntries(p=>[...p, ...newEntries]); saveBankMap(stmt?.iban, bankAcc); }
+    setRows(next);
+  };
+
+  const toggleRow  = (i) => setRows(prev=>prev.map((r,j)=>j===i?{...r,selected:!r.selected}:r));
+  const toggleAll  = (v) => setRows(prev=>prev.map(r=>r.booked?r:{...r,selected:v}));
+  const setKonto   = (i,v) => setRows(prev=>prev.map((r,j)=>j===i?{...r,konto:v,source:v?"manuell":"",
+                                         text:r.text||defaultText(r),error:""}:r));
+  const setRowText = (i,v) => setRows(prev=>prev.map((r,j)=>j===i?{...r,text:v}:r));
 
   const accName = n => accounts.find(a=>a.number===n)?.name||"—";
   const catColor = {aktiven:"#1D4ED8",passiven:"#15803D",ertrag:"#059669",aufwand:"#DC2626"};
   const accColor = n => { const a=accounts.find(x=>x.number===n); return a?catColor[a.category]:MUTED; };
-  const selectedCount = csvResults.filter(r=>r.selected&&r.suggestion&&!r.booked).length;
-  const bookedCount   = csvResults.filter(r=>r.booked).length;
 
   return (
     <div style={{maxWidth:900,margin:"0 auto"}}>
@@ -2160,7 +2479,7 @@ Antworte NUR mit einem JSON-Objekt mit dem Array "buchungen", genau ein Objekt p
                    padding:"20px 24px",marginBottom:20,color:"white"}}>
         <div style={{fontWeight:800,fontSize:17,letterSpacing:-.3}}>🤖 Buchungsassistent</div>
         <div style={{fontSize:12,opacity:.7,marginTop:4}}>
-          Einzelbeleg beschreiben oder hochladen — oder Kontoauszug als CSV importieren
+          Einzelbeleg beschreiben oder hochladen — oder Kontoauszug (camt.053 / CSV) importieren
         </div>
         <div style={{fontSize:11,opacity:.55,marginTop:6}}>
           KI: {LLM_LABEL}{LLM_CONFIG.provider==="openai" ? ` · ${LLM_CONFIG.baseUrl}` : ""}
@@ -2170,7 +2489,7 @@ Antworte NUR mit einem JSON-Objekt mit dem Array "buchungen", genau ein Objekt p
       {/* Mode switcher */}
       <div style={{display:"flex",gap:0,marginBottom:20,background:"white",borderRadius:8,
                    border:"1px solid #E2E8F0",padding:4,width:"fit-content"}}>
-        {[["single","📎 Einzelbeleg"],["csv","📊 CSV-Kontoauszug"]].map(([m,label])=>(
+        {[["single","📎 Einzelbeleg"],["bank","🏦 Kontoauszug"]].map(([m,label])=>(
           <button key={m} onClick={()=>setMode(m)} style={{
             padding:"7px 18px",border:"none",borderRadius:6,cursor:"pointer",
             fontSize:13,fontWeight:mode===m?700:400,fontFamily:"inherit",
@@ -2286,12 +2605,14 @@ Antworte NUR mit einem JSON-Objekt mit dem Array "buchungen", genau ein Objekt p
         </div>
       )}
 
-      {/* ── CSV MODE ── */}
-      {mode==="csv" && csvRows.length===0 && (
+      {/* ── KONTOAUSZUG ── */}
+      {mode==="bank" && !stmt && (
         <Card title="Kontoauszug importieren">
           <div style={{fontSize:13,color:"#64748B",marginBottom:14,lineHeight:1.6}}>
-            Unterstütztes Format: <strong>neon CSV-Kontoauszug</strong> (Semikolon-getrennt, Spalten: Date, Amount, Description, Subject, Category…)<br/>
-            {LLM_LABEL} analysiert alle Transaktionen und schlägt Buchungen vor — du überprüfst und buchst mit einem Klick.
+            Empfohlen: <strong>camt.053</strong> (ISO 20022 XML, im E-Banking unter «Kontoauszug / camt» exportieren).
+            Ebenfalls möglich: camt.052/.054 sowie <strong>CSV</strong> der meisten Banken (Spalten werden automatisch erkannt).<br/>
+            Datum und Betrag werden direkt aus der Datei übernommen — {LLM_LABEL} schlägt nur das <strong>Gegenkonto</strong> und
+            den Buchungstext vor. Gegenparteien, die du schon mehrfach gleich gebucht hast, werden ohne KI zugeordnet.
           </div>
           <label style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8,
                          padding:"32px 16px",border:"2px dashed #CBD5E1",borderRadius:8,
@@ -2299,130 +2620,155 @@ Antworte NUR mit einem JSON-Objekt mit dem Array "buchungen", genau ein Objekt p
                          transition:"border-color .15s"}}
             onMouseEnter={e=>e.currentTarget.style.borderColor="#0F2460"}
             onMouseLeave={e=>e.currentTarget.style.borderColor="#CBD5E1"}>
-            <span style={{fontSize:36}}>📊</span>
-            <span style={{fontWeight:600,color:"#334155"}}>CSV-Datei hochladen</span>
-            <span style={{fontSize:11}}>neon Kontoauszug · Semikolon-getrennt</span>
-            <input type="file" accept=".csv" onChange={handleCsv} style={{display:"none"}}/>
+            <span style={{fontSize:36}}>🏦</span>
+            <span style={{fontWeight:600,color:"#334155"}}>Kontoauszug hochladen</span>
+            <span style={{fontSize:11}}>camt.053 / .052 / .054 (XML) · CSV</span>
+            <input type="file" accept=".xml,.csv,.txt" onChange={handleStatement} style={{display:"none"}}/>
           </label>
           {error&&<div style={{marginTop:10,padding:"7px 10px",background:"#FEF2F2",borderRadius:5,color:"#DC2626",fontSize:12}}>⚠ {error}</div>}
         </Card>
       )}
 
-      {mode==="csv" && csvRows.length>0 && (
+      {mode==="bank" && stmt && (()=>{
+        const open      = rows.filter(r=>!r.booked);
+        const todoCount = open.filter(r=>!r.konto).length;
+        const readyCount= open.filter(r=>r.selected&&r.konto).length;
+        const dupCount  = rows.filter(r=>r.dup).length;
+        const booked    = rows.filter(r=>r.booked&&!r.dup).length;
+        const fromHist  = open.filter(r=>r.source==="verlauf").length;
+        const canBook   = readyCount>0 && !ccyMismatch && (bankCur===CHF || rateNum>0);
+        const srcBadge  = { verlauf:["Verlauf","#7C3AED","#F5F3FF"], ki:["KI","#0369A1","#F0F9FF"], manuell:["manuell","#475569","#F1F5F9"] };
+        return (
         <div>
+          {/* Auszug-Info und Bankkonto */}
+          <div style={{background:"white",borderRadius:10,border:"1px solid #E2E8F0",padding:"12px 16px",marginBottom:12,
+                       display:"flex",gap:16,alignItems:"flex-end",flexWrap:"wrap"}}>
+            <div style={{flex:"1 1 260px",fontSize:12,color:"#475569",lineHeight:1.6}}>
+              <div style={{fontWeight:700,color:"#0F2460",fontSize:13}}>{stmt.fileName}</div>
+              {stmt.format}{stmt.iban?` · ${stmt.iban}`:""} · {stmt.currency} · {rows.length} Transaktionen
+              {dupCount>0&&<> · {dupCount} bereits importiert</>}
+              {fromHist>0&&<> · {fromHist} aus Verlauf zugeordnet</>}
+              {stmt.info.map((x,i)=><div key={i} style={{fontSize:11,color:MUTED}}>ℹ {x}</div>)}
+            </div>
+            <Field label="Bankkonto im Kontenplan" style={{flex:"0 1 260px"}}>
+              <select value={bankAcc} onChange={e=>changeBankAcc(e.target.value)} style={{...IS,fontSize:13}}>
+                <option value="">— wählen —</option>
+                {accounts.filter(a=>a.category==="aktiven").sort((a,b)=>a.number.localeCompare(b.number)).map(a=>(
+                  <option key={a.number} value={a.number}>{a.number} – {a.name}{a.currency&&a.currency!==CHF?` [${a.currency}]`:""}</option>
+                ))}
+              </select>
+            </Field>
+            {bankCur!==CHF&&!ccyMismatch&&(
+              <Field label={`Kurs CHF je 1 ${bankCur}`} style={{flex:"0 1 150px"}}>
+                <input type="number" step="0.0001" value={rate} onChange={e=>setRate(e.target.value)}
+                  style={{...IS,fontSize:13,fontFamily:"'JetBrains Mono',monospace",textAlign:"right"}}/>
+              </Field>
+            )}
+          </div>
+          {ccyMismatch&&(
+            <div style={{marginBottom:12,padding:"7px 10px",background:"#FEF2F2",borderRadius:5,color:"#DC2626",fontSize:12}}>
+              ⚠ Der Auszug ist in {stmt.currency}, Konto {bankAcc} aber in {bankCur} – bitte ein {stmt.currency}-Konto wählen
+              (Fremdwährungskonto im Kontenplan anlegen).
+            </div>
+          )}
+          {bankCur!==CHF&&!ccyMismatch&&(
+            <div style={{marginBottom:12,fontSize:11,color:MUTED}}>
+              CHF-Betrag = {bankCur}-Betrag × Kurs (für alle Zeilen; im Journal pro Buchung anpassbar).
+            </div>
+          )}
+
           {/* Toolbar */}
           <div style={{display:"flex",gap:10,marginBottom:14,alignItems:"center",flexWrap:"wrap"}}>
-            <span style={{fontSize:13,color:"#64748B",fontWeight:600}}>
-              {csvRows.length} Transaktionen geladen
-            </span>
-            {bookedCount>0&&<span style={{background:"#F0FDF4",color:"#15803D",padding:"2px 9px",borderRadius:999,fontSize:11,fontWeight:600}}>✓ {bookedCount} gebucht</span>}
+            {booked>0&&<span style={{background:"#F0FDF4",color:"#15803D",padding:"2px 9px",borderRadius:999,fontSize:11,fontWeight:600}}>✓ {booked} gebucht</span>}
             <div style={{flex:1}}/>
-            <button onClick={()=>{setCsvRows([]);setCsvResults([]);setCsvDone(false);setError("");}} style={SB}>
-              × Neue CSV
-            </button>
-            {!csvDone&&(
-              <button onClick={analyseCsv} disabled={csvLoading}
-                style={{...PB,display:"flex",alignItems:"center",gap:8,opacity:csvLoading?.6:1}}>
-                {csvLoading
-                  ?<><span style={{display:"inline-block",width:14,height:14,border:"2px solid rgba(255,255,255,.3)",borderTop:"2px solid white",borderRadius:"50%",animation:"spin 1s linear infinite"}}/>Analysiere {csvRows.length} Buchungen{csvProgress?` (${csvProgress})`:""}…</>
-                  :<>🔍 Alle analysieren</>}
+            <button onClick={resetStatement} style={SB}>× Anderer Auszug</button>
+            {todoCount>0&&(
+              <button onClick={analyseStatement} disabled={stLoading||!bankAcc}
+                style={{...PB,display:"flex",alignItems:"center",gap:8,opacity:stLoading||!bankAcc?.6:1}}>
+                {stLoading
+                  ?<><span style={{display:"inline-block",width:14,height:14,border:"2px solid rgba(255,255,255,.3)",borderTop:"2px solid white",borderRadius:"50%",animation:"spin 1s linear infinite"}}/>Analysiere {todoCount}{stProgress?` (${stProgress})`:""}…</>
+                  :<>🔍 Gegenkonten für {todoCount} vorschlagen</>}
               </button>
             )}
-            {csvDone&&selectedCount>0&&(
-              <button onClick={bookSelected}
-                style={{...PB,background:"#16A34A",display:"flex",alignItems:"center",gap:6}}>
-                ✓ {selectedCount} ausgewählte buchen
+            {readyCount>0&&(
+              <button onClick={bookStatement} disabled={!canBook}
+                style={{...PB,background:"#16A34A",display:"flex",alignItems:"center",gap:6,opacity:canBook?1:.5}}>
+                ✓ {readyCount} ausgewählte buchen
               </button>
             )}
           </div>
+          {error&&<div style={{marginBottom:12,padding:"7px 10px",background:"#FEF2F2",borderRadius:5,color:"#DC2626",fontSize:12}}>⚠ {error}</div>}
 
-          {/* Table */}
+          {/* Tabelle */}
           <div style={{background:"white",borderRadius:10,border:"1px solid #E2E8F0",overflow:"auto",boxShadow:"0 1px 3px rgba(0,0,0,.05)"}}>
             <table style={{width:"100%",borderCollapse:"collapse",minWidth:900}}>
               <thead>
                 <tr>
                   <Th style={{width:36}}>
-                    <input type="checkbox"
-                      checked={csvResults.filter(r=>!r.booked).every(r=>r.selected)}
+                    <input type="checkbox" checked={open.length>0&&open.every(r=>r.selected)}
                       onChange={e=>toggleAll(e.target.checked)}/>
                   </Th>
-                  <Th style={{width:96}}>Datum</Th>
-                  <Th align="right" style={{width:90}}>Betrag</Th>
-                  <Th>Beschreibung</Th>
-                  <Th style={{width:80}}>Soll</Th>
-                  <Th style={{width:80}}>Haben</Th>
-                  <Th align="right" style={{width:90}}>CHF</Th>
-                  <Th style={{width:180}}>Buchungstext</Th>
-                  <Th style={{width:50}}/>
+                  <Th style={{width:92}}>Datum</Th>
+                  <Th align="right" style={{width:110}}>Betrag {stmt.currency}</Th>
+                  <Th>Gegenpartei / Text</Th>
+                  <Th style={{width:200}}>Gegenkonto</Th>
+                  <Th style={{width:200}}>Buchungstext</Th>
+                  <Th style={{width:70}}/>
                 </tr>
               </thead>
               <tbody>
-                {csvResults.map((r,i)=>{
-                  const s = r.suggestion;
-                  const isBooked = r.booked;
+                {rows.map((r,i)=>{
+                  const inc = r.amount>0;
+                  const badge = srcBadge[r.source];
                   return (
-                    <tr key={i} style={{
-                      opacity: isBooked?.5:1,
-                      background: isBooked?"#F0FDF4":r.selected?"white":"#FAFAFA"
-                    }}>
+                    <tr key={r.key} style={{opacity:r.booked?.5:1,
+                                            background:r.booked?"#F0FDF4":r.selected?"white":"#FAFAFA"}}>
                       <Td>
-                        {isBooked
-                          ? <span style={{color:"#15803D",fontWeight:700,fontSize:13}}>✓</span>
+                        {r.booked
+                          ? <span style={{color:"#15803D",fontWeight:700,fontSize:13}} title={r.dup?"bereits früher importiert":"gebucht"}>✓</span>
                           : <input type="checkbox" checked={r.selected} onChange={()=>toggleRow(i)}/>}
                       </Td>
-                      <Td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"#475569"}}>
-                        {s?.date||r.Date}
-                      </Td>
+                      <Td style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"#475569"}}>{r.date}</Td>
                       <Td align="right" style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,
-                        fontWeight:600,color:Number(r.Amount)<0?"#DC2626":"#059669"}}>
-                        {r.Amount}
+                        fontWeight:600,color:inc?"#059669":"#DC2626"}}>
+                        {inc?"+":"−"}{fmt(Math.abs(r.amount))}
                       </Td>
                       <Td style={{fontSize:12,color:"#334155"}}>
-                        <div style={{fontWeight:500}}>{r.Description}</div>
-                        {r.Subject&&<div style={{fontSize:10,color:MUTED}}>{r.Subject}</div>}
+                        <div style={{fontWeight:500}}>{r.counterparty||"—"}</div>
+                        {r.bankText&&<div style={{fontSize:10,color:MUTED,maxWidth:340,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}
+                                          title={r.bankText}>{r.bankText}</div>}
+                        {r.dup&&<div style={{fontSize:10,color:"#15803D"}}>bereits importiert</div>}
                       </Td>
-                      {s ? (
-                        <>
-                          <Td>
-                            <select value={s.debit} onChange={e=>updateSugg(i,"debit",e.target.value)}
-                              style={{...IS,padding:"3px 6px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",
-                                      fontWeight:700,color:accColor(s.debit),width:75}}>
-                              {accounts.sort((a,b)=>a.number.localeCompare(b.number)).map(a=>(
-                                <option key={a.number} value={a.number}>{a.number}</option>
-                              ))}
-                            </select>
-                          </Td>
-                          <Td>
-                            <select value={s.credit} onChange={e=>updateSugg(i,"credit",e.target.value)}
-                              style={{...IS,padding:"3px 6px",fontSize:11,fontFamily:"'JetBrains Mono',monospace",
-                                      fontWeight:700,color:accColor(s.credit),width:75}}>
-                              {accounts.sort((a,b)=>a.number.localeCompare(b.number)).map(a=>(
-                                <option key={a.number} value={a.number}>{a.number}</option>
-                              ))}
-                            </select>
-                          </Td>
-                          <Td align="right" style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,fontWeight:600}}>
-                            {fmt(s.amount)}
-                          </Td>
-                          <Td>
-                            <input value={s.description} onChange={e=>updateSugg(i,"description",e.target.value)}
-                              style={{...IS,padding:"3px 6px",fontSize:11,width:"100%"}}/>
-                          </Td>
-                        </>
-                      ) : (
-                        <td colSpan={4} style={{padding:"8px 12px",fontSize:11,color:MUTED,fontStyle:"italic"}}>
-                          {csvLoading?"Wird analysiert…":"—"}
-                        </td>
-                      )}
                       <Td>
-                        {s&&!isBooked&&(
-                          <div style={{fontSize:10,color:MUTED,lineHeight:1.3}} title={s.reasoning}>
-                            ℹ️
+                        <select value={r.konto} disabled={r.booked} onChange={e=>setKonto(i,e.target.value)}
+                          style={{...IS,padding:"3px 6px",fontSize:11,width:"100%",
+                                  fontWeight:r.konto?700:400,color:r.konto?accColor(r.konto):MUTED}}>
+                          <option value="">— Gegenkonto —</option>
+                          {accounts.filter(a=>a.number!==bankAcc).sort((a,b)=>a.number.localeCompare(b.number)).map(a=>(
+                            <option key={a.number} value={a.number}>{a.number} {a.name}</option>
+                          ))}
+                        </select>
+                        {r.konto&&bankAcc&&(
+                          <div style={{fontSize:10,color:MUTED,marginTop:2,fontFamily:"'JetBrains Mono',monospace"}}>
+                            S {inc?bankAcc:r.konto} · H {inc?r.konto:bankAcc}
                           </div>
                         )}
-                        {r.error&&!isBooked&&(
-                          <div style={{fontSize:12,color:"#DC2626",cursor:"help"}} title={r.error}>⚠</div>
-                        )}
+                      </Td>
+                      <Td>
+                        <input value={r.text} disabled={r.booked} placeholder={defaultText(r)}
+                          onChange={e=>setRowText(i,e.target.value)}
+                          style={{...IS,padding:"3px 6px",fontSize:11,width:"100%"}}/>
+                      </Td>
+                      <Td>
+                        <div style={{display:"flex",gap:4,alignItems:"center"}}>
+                          {badge&&!r.booked&&(
+                            <span title={r.why||""} style={{fontSize:9.5,fontWeight:700,padding:"1px 6px",borderRadius:999,
+                                         color:badge[1],background:badge[2],cursor:r.why?"help":"default"}}>{badge[0]}</span>
+                          )}
+                          {r.error&&!r.booked&&(
+                            <span style={{fontSize:12,color:"#DC2626",cursor:"help"}} title={r.error}>⚠</span>
+                          )}
+                        </div>
                       </Td>
                     </tr>
                   );
@@ -2430,14 +2776,12 @@ Antworte NUR mit einem JSON-Objekt mit dem Array "buchungen", genau ein Objekt p
               </tbody>
             </table>
           </div>
-
-          {csvDone&&(
-            <div style={{marginTop:10,fontSize:12,color:"#64748B",textAlign:"center"}}>
-              Hover über ℹ️ für Begründung · Soll/Haben und Buchungstext direkt in der Tabelle editierbar
-            </div>
-          )}
+          <div style={{marginTop:10,fontSize:12,color:"#64748B",textAlign:"center"}}>
+            Badge «Verlauf» = aus früheren Buchungen · «KI» = Vorschlag {LLM_LABEL} (Hover für Begründung) · Gegenkonto und Text sind editierbar
+          </div>
         </div>
-      )}
+        );
+      })()}
 
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
@@ -2601,7 +2945,8 @@ function App() {
                                                setEntries={setEntries} getSaldo={getSaldo}
                                                getFxSaldo={getFxSaldo} fxRates={fxRates}
                                                setFxRates={setFxRates} year={year}/>}
-        {tab==="assistent"  && <AssistentTab accounts={accounts} setEntries={setEntries} year={year}/>}
+        {tab==="assistent"  && <AssistentTab accounts={accounts} entries={entries} setEntries={setEntries}
+                                               fxRates={fxRates} year={year}/>}
       </div>
     </div>
   );
