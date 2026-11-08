@@ -297,6 +297,19 @@ const normalizeEntry = (raw, accounts) => {
   return { entry:{ ...base, fxCurrency:currency, fxAmount:fx, fxRate:+(amt/fx).toFixed(6) } };
 };
 
+// Nächste freie Belegnummer im Format «<Jahr>-NNN» (Jahr aus dem Buchungsdatum).
+// Gezählt werden nur Nummern genau dieses Formats; andere (z. B. «FW-BEW-2026»,
+// Fremdbelegnummern) bleiben unberücksichtigt. extra = bereits vergebene, noch nicht gebuchte.
+const nextReference = (entries, date, extra=[]) => {
+  const y  = /^\d{4}/.test(date||"") ? date.slice(0,4) : String(new Date().getFullYear());
+  const re = new RegExp(`^${y}-(\\d+)$`);
+  const max = [...entries.map(e=>e.reference), ...extra].reduce((m,r)=>{
+    const hit = re.exec(String(r||"").trim());
+    return hit ? Math.max(m, parseInt(hit[1],10)) : m;
+  }, 0);
+  return `${y}-${String(max+1).padStart(3,"0")}`;
+};
+
 // Stichtagsbewertung aller Fremdwährungskonten
 //  – Verluste werden immer gebucht (Vorsichtsprinzip, OR 960 Abs. 2)
 //  – Gewinne standardmässig nur auf flüssigen Mitteln / kurzfristigen Wertschriften
@@ -556,7 +569,7 @@ const FxAmountNote = ({ e }) => !e.fxCurrency ? null : (
 // ═══════════════════════════════════════════════════════════════
 function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFxRates, year, settings, setSettings }) {
   const blank = { date:`${year}-01-01`, description:"", debit:"", credit:"", amount:"", reference:"",
-                  fxAmount:"", fxRate:"", fxReval:false };
+                  refAuto:true, fxAmount:"", fxRate:"", fxReval:false };
   const [form,    setForm]    = useState(blank);
   const [error,   setError]   = useState("");
   const [filterY, setFilterY] = useState(true);
@@ -585,11 +598,14 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
       : a.date.localeCompare(b.date)||a.id-b.id);
   },[entries,year,filterY,sortDir]);
 
+  // Belegnummer automatisch vorbelegen, solange sie nicht von Hand geändert wurde
+  const formRef = form.refAuto ? nextReference(entries, form.date) : form.reference;
+
   const add = () => {
-    const { entry, error } = normalizeEntry(form, accounts);
+    const { entry, error } = normalizeEntry({ ...form, reference:formRef }, accounts);
     if(error){ setError(error); return; }
     setEntries(p=>[...p,{ ...entry, id:Date.now() }]);
-    setForm(p=>({...p, description:"", amount:"", reference:"", fxAmount:"", fxReval:false}));
+    setForm(p=>({...p, description:"", amount:"", reference:"", refAuto:true, fxAmount:"", fxReval:false}));
     setError("");
   };
 
@@ -658,8 +674,10 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
               placeholder="z. B. Mitgliederbeitrag Meyer" style={IS} />
           </Field>
           <Field label="Belegnummer">
-            <input type="text" value={form.reference} onChange={e=>f("reference",e.target.value)}
-              placeholder="RE-001" style={IS} />
+            <input type="text" value={formRef}
+              onChange={e=>setForm(p=>({...p, reference:e.target.value, refAuto:false}))}
+              title={form.refAuto ? "Automatisch: nächste freie Belegnummer" : "Manuell gesetzt"}
+              placeholder="2026-001" style={{...IS, color: form.refAuto ? "#64748B" : undefined}} />
           </Field>
           <Field label="Betrag CHF *">
             <input type="number" step="0.05" min="0.01" value={form.amount}
@@ -2401,6 +2419,7 @@ Regeln:
 - Wird ein Konto mit Fremdwährung (z.B. "Währung EUR") bebucht: zusätzlich "fxCurrency" (ISO-Code) und
   "fxAmount" (positiver Betrag in Fremdwährung) angeben; "amount" = CHF zum Kurs gemäss Beleg bzw. Tageskurs
 - Aufwand und Ertrag immer in CHF; Fremdwährungsbeträge auf CHF-Konten in CHF umrechnen (fxCurrency/fxAmount = null)
+- Rechnungs-/Belegnummer des Absenders (falls vorhanden) in den Buchungstext aufnehmen
 - Kein Markdown, nur reines JSON`;
 
   // Fremdwährungsfelder eines KI-Vorschlags für das Formular aufbereiten
@@ -2409,7 +2428,7 @@ Regeln:
     const fx = parseNum(s.fxAmount), amt = parseNum(s.amount);
     const str = v => v==null ? "" : String(v).trim();
     // Typen vereinheitlichen: lokale Modelle liefern Kontonummern oft als Zahl, Beträge als String
-    return { ...s, date:str(s.date), description:str(s.description), reference:str(s.reference),
+    return { ...s, date:str(s.date), description:str(s.description), reference:"", refAuto:true,
              debit:str(s.debit), credit:str(s.credit), amount: isNaN(amt) ? "" : Math.abs(amt),
              fxAmount: fx>0 ? String(fx) : "", fxRate: fx>0&&amt>0 ? String(+(amt/fx).toFixed(6)) : "",
              fxReval:false };
@@ -2440,7 +2459,7 @@ Regeln:
     parts.push({ type:"text", text: text.trim()||"Analysiere diesen Beleg und schlage eine Buchung vor." });
     try {
       const raw = await callLLM({
-        system: systemPrompt+"\n\nAntworte NUR mit einem JSON-Objekt:\n{\"date\":\"YYYY-MM-DD\",\"description\":\"...\",\"reference\":\"...\",\"debit\":\"NNNN\",\"credit\":\"NNNN\",\"amount\":0.00,\"fxCurrency\":null,\"fxAmount\":null,\"reasoning\":\"...\"}",
+        system: systemPrompt+"\n\nAntworte NUR mit einem JSON-Objekt:\n{\"date\":\"YYYY-MM-DD\",\"description\":\"...\",\"debit\":\"NNNN\",\"credit\":\"NNNN\",\"amount\":0.00,\"fxCurrency\":null,\"fxAmount\":null,\"reasoning\":\"...\"}",
         parts, maxTokens:1000,
       });
       let parsed = parseLLMJson(raw);
@@ -2452,12 +2471,16 @@ Regeln:
     setLoading(false);
   };
 
+  const suggRef = suggestion
+    ? (suggestion.refAuto ? nextReference(entries, suggestion.date) : suggestion.reference) : "";
+
   const bookSingle = () => {
     if(!suggestion) return;
     const accErr = checkSuggestionAccounts(suggestion, accounts);
     if(accErr){ setError(accErr); return; }
-    const { entry, error } = normalizeEntry(suggestion, accounts);
+    const { entry, error } = normalizeEntry({ ...suggestion, reference:suggRef }, accounts);
     if(error){ setError(error); return; }
+    setSuggestion(p=>({ ...p, reference:suggRef, refAuto:false }));
     setEntries(p=>[...p,{ ...entry, id:Date.now() }]);
     setError("");
     setBooked(true);
@@ -2616,7 +2639,14 @@ Antworte NUR mit JSON, genau ein Eintrag pro Transaktion, "nr" wie oben:
       newEntries.push({ ...entry, id:Date.now()+Math.random() });
       return { ...r, booked:true, error:"" };
     });
-    if(newEntries.length){ setEntries(p=>[...p, ...newEntries]); saveBankMap(stmt?.iban, bankAcc); }
+    if(newEntries.length){
+      // fortlaufende Belegnummern in chronologischer Reihenfolge vergeben
+      const given = [];
+      newEntries.sort((a,b)=>a.date.localeCompare(b.date)).forEach(e=>{
+        e.reference = nextReference(entries, e.date, given); given.push(e.reference);
+      });
+      setEntries(p=>[...p, ...newEntries]); saveBankMap(stmt?.iban, bankAcc);
+    }
     setRows(next);
   };
 
@@ -2711,8 +2741,10 @@ Antworte NUR mit JSON, genau ein Eintrag pro Transaktion, "nr" wie oben:
               onChange={e=>setSuggestion(p=>({...p,date:e.target.value}))} style={{...IS,fontSize:13}}/></Field></div>
             <div style={{gridColumn:"span 2"}}><Field label="Buchungstext"><input type="text" value={suggestion.description}
               onChange={e=>setSuggestion(p=>({...p,description:e.target.value}))} style={{...IS,fontSize:13}}/></Field></div>
-            <div><Field label="Belegnummer"><input type="text" value={suggestion.reference||""}
-              onChange={e=>setSuggestion(p=>({...p,reference:e.target.value}))} style={{...IS,fontSize:13}}/></Field></div>
+            <div><Field label="Belegnummer"><input type="text" value={suggRef}
+              onChange={e=>setSuggestion(p=>({...p,reference:e.target.value,refAuto:false}))}
+              title={suggestion.refAuto ? "Automatisch: nächste freie Belegnummer" : "Manuell gesetzt"}
+              style={{...IS,fontSize:13,color:suggestion.refAuto?"#64748B":undefined}}/></Field></div>
           </div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 160px",gap:10,marginBottom:16}}>
             <Field label="Soll (Debit)"><AccountSelect accounts={accounts} value={suggestion.debit} onChange={v=>sf("debit",v)}/></Field>
