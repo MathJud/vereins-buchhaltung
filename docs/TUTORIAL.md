@@ -1,13 +1,10 @@
 # Tutorial: Vereins-Buchhaltung Schritt für Schritt
 
-Dieses Tutorial führt durch zwei typische Abläufe:
-
-- **Teil A:** Kontenplan mit Fremdwährungskonten einrichten (manuell oder per Import)
-- **Teil B:** Lokales KI-Modell starten, mit der Buchhaltung verbinden und Kontoauszüge (camt / CSV) buchen
+Dieses Tutorial führt durch typische Abläufe bei der Verwendung dieser Buchhaltungssoftware.
 
 ---
 
-## Teil 0 – Vorbereitung
+## Vorbereitung
 
 1. Repository klonen oder `Meine_Buchhaltung.html` zusammen mit dem Ordner `kontenplaene/` herunterladen.
 2. Die Datei im Browser öffnen (Doppelklick genügt). Für die KMU-Vorlage die Seite über einen Webserver
@@ -24,9 +21,9 @@ Dieses Tutorial führt durch zwei typische Abläufe:
 
 ---
 
-## Teil A – Kontenplan mit Fremdwährungskonten
+## Kontenplan mit Fremdwährungskonten
 
-### A1. Kontenplan-Vorlage wählen
+### Kontenplan-Vorlage wählen
 
 Zwei Vorlagen werden mitgeliefert (JSON-Dateien im Ordner `kontenplaene/`):
 
@@ -64,7 +61,7 @@ window.APP_CONFIG = {
 `name` und `defaultVorlage` gelten nur für eine **neue** Buchhaltung (leerer Browser-Speicher). Danach
 werden Name und Kontenplan unter **⚙️ Einstellungen** geändert.
 
-### A2. Fremdwährungskonto manuell anlegen
+### Fremdwährungskonto manuell anlegen
 
 1. Tab **📋 Kontenplan** öffnen → **+ Neues Konto**.
 2. Felder ausfüllen, z. B. für ein Euro-Bankkonto:
@@ -100,7 +97,7 @@ Weitere sinnvolle Konten:
 > **Tipp:** Ein eigenes Konto für Bankspesen hilft der KI beim Kontoauszug-Import, Gebühren korrekt
 > zuzuordnen. Die Vereinsvorlage hat keines (z. B. `6800 Bankspesen` anlegen), die KMU-Vorlage hat `6940`.
 
-### A3. Kontenplan importieren und exportieren
+### Kontenplan importieren und exportieren
 
 Unter **⚙️ Einstellungen → Kontenplan exportieren / importieren**:
 
@@ -171,7 +168,7 @@ curl -s http://localhost:11434/v1/chat/completions -H "Content-Type: application
 Das Ergebnis **vor dem Import kontrollieren** – der Import prüft zwar das Format, aber nicht, ob die
 Zuordnung inhaltlich stimmt.
 
-### A4. Mit Fremdwährungskonten buchen
+### Mit Fremdwährungskonten buchen
 
 **Eröffnungssaldo:** Die Software kennt keine separate Eröffnungsbilanz. Den Anfangsbestand eines
 EUR-Kontos als Buchung per 1.1. erfassen, z. B. Soll `1021` / Haben `2800`.
@@ -187,7 +184,7 @@ EUR-Kontos als Buchung per 1.1. erfassen, z. B. Soll `1021` / Haben `2800`.
 Einschränkung: Soll und Haben dürfen nicht zwei *verschiedene* Fremdwährungen haben. Ein Wechsel
 EUR → USD wird in zwei Buchungen über ein CHF-Konto erfasst.
 
-### A5. Jahresabschluss: Bewertung zum Stichtagskurs
+### Jahresabschluss: Bewertung zum Stichtagskurs
 
 1. Tab **💱 Fremdwährung** öffnen.
 2. Unter **Stichtagskurse per 31.12.** für jede Währung den Kurs eintragen (Mittelkurs, z. B. aus der
@@ -203,9 +200,9 @@ Die **⚖️ Bilanz** zeigt die Fremdwährungspositionen danach mit Stichtagskur
 
 ---
 
-## Teil B – Lokales Modell und Kontoauszug-Import
+## Lokales Modell und Kontoauszug-Import
 
-### B1. Lokales Modell installieren und starten
+### Lokales Modell installieren und starten
 
 Die Buchhaltung spricht jeden **OpenAI-kompatiblen** Server an. Empfohlen wird **Ollama**.
 
@@ -285,7 +282,7 @@ Die Buchhaltung spricht jeden **OpenAI-kompatiblen** Server an. Empfohlen wird *
 > **Fehlermeldung «Modell-Server unter … nicht erreichbar»** → Server läuft nicht, falsche `baseUrl`
 > oder CORS nicht freigegeben (`OLLAMA_ORIGINS="*"` bzw. «Enable CORS»).
 
-### B3. Kontoauszug bei der Bank exportieren
+### Kontoauszug bei der Bank exportieren
 
 | Format        | Empfehlung                                                                                                   |
 |---------------|--------------------------------------------------------------------------------------------------------------|
@@ -301,7 +298,7 @@ Hinweise:
   automatisch erkannt. Nötig ist mindestens eine Datumsspalte und eine Betragsspalte (`Betrag` oder
   `Belastung`/`Gutschrift`).
 
-### B4. Kontoauszug importieren und buchen
+### Kontoauszug importieren und buchen
 
 1. Tab **🤖 Buchungsassistent** → Umschalter **🏦 Kontoauszug**.
 2. **Kontoauszug hochladen** → `.xml` (camt) oder `.csv` wählen.
@@ -334,7 +331,7 @@ Was die Software garantiert:
 - **Sammelbuchungen** (camt) werden in Einzelzahlungen aufgeteilt, sofern die Bank die Einzelbeträge
   mitliefert. Vorgemerkte (nicht gebuchte) Positionen werden ignoriert.
 
-### B5. Fremdwährungs-Kontoauszug (z. B. EUR) buchen
+### Fremdwährungs-Kontoauszug (z. B. EUR) buchen
 
 1. Voraussetzung: Ein EUR-Konto existiert im Kontenplan (Teil A2, z. B. `1021 Bankkonto EUR`).
 2. EUR-Auszug hochladen → als Bankkonto `1021 – Bankkonto EUR [EUR]` wählen.
@@ -350,7 +347,7 @@ Sonderfall: Eine **CHF-Zahlung auf ein EUR-Gegenkonto** (z. B. Begleichung einer
 vom CHF-Konto) übernimmt den EUR-Originalbetrag automatisch, sofern der camt-Auszug ihn enthält
 (`InstdAmt`). Bei CSV muss er im Journal nachgetragen werden.
 
-### B6. Tipps für gute Ergebnisse mit lokalen Modellen
+### Tipps für gute Ergebnisse mit lokalen Modellen
 
 - **Sprechende Kontonamen** verwenden («Mitgliederbeiträge», «Bankspesen», «Miete Probelokal») –
   das Modell sieht nur Nummer, Name und Kategorie.
