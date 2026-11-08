@@ -332,13 +332,29 @@ const computeFxValuation = ({ accounts, getSaldo, getFxSaldo, rates, year }) =>
                defaultBook: !!diff && (!isGain || gainAllowed) };
     });
 
+// Eindeutige Buchungs-IDs: streng monoton, auch bei mehreren Aufrufen in derselben Millisekunde
+let lastEntryId = 0;
+const newEntryId = () => (lastEntryId = Math.max(Date.now(), lastEntryId+1));
+
+// Doppelte oder fehlende IDs (z. B. aus älteren Daten) durch neue, eindeutige ersetzen
+const withUniqueIds = (entries) => {
+  const all  = new Set(entries.map(e=>e.id));
+  const seen = new Set();
+  return entries.map(e=>{
+    if(e.id!=null && !seen.has(e.id)){ seen.add(e.id); return e; }
+    let id; do { id = newEntryId(); } while(all.has(id));
+    all.add(id); seen.add(id);
+    return { ...e, id };
+  });
+};
+
 const makeRevalEntry = (row, gainAcc, lossAcc, year, idx) => {
   const a = row.account;
   const increase   = row.diff>0;                       // CHF-Saldo (Normalsicht) steigt
   const accOnDebit = a.category==="aktiven" ? increase : !increase;
   const counter    = row.isGain ? gainAcc : lossAcc;
   return {
-    id: Date.now()+idx,
+    id: newEntryId(),
     date: `${year}-12-31`,
     description: `Fremdwährungsbewertung ${a.currency} ${fmt(row.fxSaldo)} @ ${fmtRate(row.rate)} (Kurs${row.isGain?"gewinn":"verlust"})`,
     reference: `FW-BEW-${year}`,
@@ -573,7 +589,7 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
   const [form,    setForm]    = useState(blank);
   const [error,   setError]   = useState("");
   const [filterY, setFilterY] = useState(true);
-  const [sortDir, setSortDir] = useState("desc");
+  const [sort,    setSort]    = useState({ key:"date", dir:"desc" });
   const [editing, setEditing] = useState(null); // {id, date, description, reference, debit, credit, amount}
   const [editErr, setEditErr] = useState("");
 
@@ -593,10 +609,32 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
 
   const visible = useMemo(()=>{
     const arr = filterY ? entries.filter(e=>e.date.startsWith(String(year))) : [...entries];
-    return arr.sort((a,b)=> sortDir==="desc"
-      ? b.date.localeCompare(a.date)||b.id-a.id
-      : a.date.localeCompare(b.date)||a.id-b.id);
-  },[entries,year,filterY,sortDir]);
+    const txt = (x,y) => String(x||"").localeCompare(String(y||""),"de",{numeric:true,sensitivity:"base"});
+    const cmp = {
+      date:        (a,b) => a.date.localeCompare(b.date),
+      reference:   (a,b) => txt(a.reference,b.reference),
+      description: (a,b) => txt(a.description,b.description),
+      debit:       (a,b) => txt(a.debit,b.debit),
+      credit:      (a,b) => txt(a.credit,b.credit),
+      amount:      (a,b) => Number(a.amount)-Number(b.amount),
+    }[sort.key];
+    const sign = sort.dir==="desc" ? -1 : 1;
+    // Bei Gleichstand nach Datum, dann Erfassungsreihenfolge
+    return arr.sort((a,b)=> sign*(cmp(a,b) || a.date.localeCompare(b.date) || a.id-b.id));
+  },[entries,year,filterY,sort]);
+
+  const toggleSort = (key) => setSort(p => p.key===key
+    ? { key, dir: p.dir==="asc" ? "desc" : "asc" }
+    : { key, dir: key==="date"||key==="amount" ? "desc" : "asc" });
+  const SortTh = ({ k, children, align }) => (
+    <Th align={align} onClick={()=>toggleSort(k)} title="Klicken zum Sortieren"
+        style={{cursor:"pointer",userSelect:"none", ...(sort.key===k ? {color:"#1E293B"} : {})}}>
+      {children}
+      <span style={{marginLeft:4,opacity:sort.key===k?1:.3}}>
+        {sort.key===k ? (sort.dir==="asc" ? "▲" : "▼") : "↕"}
+      </span>
+    </Th>
+  );
 
   // Belegnummer automatisch vorbelegen, solange sie nicht von Hand geändert wurde
   const formRef = form.refAuto ? nextReference(entries, form.date) : form.reference;
@@ -604,7 +642,7 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
   const add = () => {
     const { entry, error } = normalizeEntry({ ...form, reference:formRef }, accounts);
     if(error){ setError(error); return; }
-    setEntries(p=>[...p,{ ...entry, id:Date.now() }]);
+    setEntries(p=>[...p,{ ...entry, id:newEntryId() }]);
     setForm(p=>({...p, description:"", amount:"", reference:"", refAuto:true, fxAmount:"", fxReval:false}));
     setError("");
   };
@@ -642,7 +680,7 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
       try {
         const d = JSON.parse(ev.target.result);
         if(d.accounts) setAccounts(d.accounts);
-        if(d.entries)  setEntries(d.entries);
+        if(d.entries)  setEntries(withUniqueIds(d.entries));
         setFxRates(d.fxRates||{});
         // Name der Organisation (ältere Backups: Feld «verein»), Kontenplan-Name, Kursdifferenz-Konten
         const name = String(d.name ?? d.verein ?? "").trim();
@@ -709,9 +747,6 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
           <input type="checkbox" checked={filterY} onChange={e=>setFilterY(e.target.checked)}/>
           Nur {year}
         </label>
-        <button onClick={()=>setSortDir(d=>d==="desc"?"asc":"desc")} style={SB}>
-          {sortDir==="desc"?"↓ Neueste":"↑ Älteste"}
-        </button>
         <div style={{flex:1}}/>
         <span style={{fontSize:12,color:MUTED}}>{visible.length} Buchungen</span>
         <button onClick={exportCSV} style={SB}>📥 CSV Export</button>
@@ -728,12 +763,12 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
         <table style={{width:"100%",borderCollapse:"collapse"}}>
           <thead>
             <tr>
-              <Th>Datum</Th>
-              <Th>Belegnr.</Th>
-              <Th>Buchungstext</Th>
-              <Th>Soll</Th>
-              <Th>Haben</Th>
-              <Th align="right">Betrag CHF</Th>
+              <SortTh k="date">Datum</SortTh>
+              <SortTh k="reference">Belegnr.</SortTh>
+              <SortTh k="description">Buchungstext</SortTh>
+              <SortTh k="debit">Soll</SortTh>
+              <SortTh k="credit">Haben</SortTh>
+              <SortTh k="amount" align="right">Betrag CHF</SortTh>
               <Th className="no-print"/>
             </tr>
           </thead>
@@ -2526,7 +2561,7 @@ Regeln:
     const { entry, error } = normalizeEntry({ ...suggestion, reference:suggRef }, accounts);
     if(error){ setError(error); return; }
     setSuggestion(p=>({ ...p, reference:suggRef, refAuto:false }));
-    setEntries(p=>[...p,{ ...entry, id:Date.now() }]);
+    setEntries(p=>[...p,{ ...entry, id:newEntryId() }]);
     setError("");
     setBooked(true);
   };
@@ -2683,7 +2718,7 @@ Antworte NUR mit JSON, genau ein Eintrag pro Transaktion, "nr" wie oben:
       if(r.konto===bankAcc) return { ...r, error:"Gegenkonto = Bankkonto" };
       const { entry, error } = statementEntry(r);
       if(error) return { ...r, error };
-      newEntries.push({ ...entry, id:Date.now()+Math.random() });
+      newEntries.push({ ...entry, id:newEntryId() });
       return { ...r, booked:true, error:"" };
     });
     if(newEntries.length){
@@ -3194,7 +3229,7 @@ function App() {
         firstRun = false;
         const d = JSON.parse(raw);
         if(d.accounts) setAccounts(d.accounts);
-        if(d.entries)  setEntries(d.entries);
+        if(d.entries)  setEntries(withUniqueIds(d.entries));
         if(d.year)     setYear(d.year);
         if(d.fxRates)  setFxRates(d.fxRates);
         if(d.settings) setSettings(p=>({ ...p, ...d.settings }));
