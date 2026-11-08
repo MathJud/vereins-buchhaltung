@@ -2448,9 +2448,14 @@ const saveBankMap = (iban, acc) => {
   if(!iban) return;
   try { localStorage.setItem(BANK_MAP_KEY, JSON.stringify({ ...loadBankMap(), [iban]:acc })); } catch {}
 };
+const LAST_BANK_KEY = "werckmeister_last_bank_acc";   // zuletzt gewähltes Bankkonto (pro Browser)
+const saveLastBank = (acc) => { if(acc) try { localStorage.setItem(LAST_BANK_KEY, acc); } catch {} };
 const guessBankAccount = (accounts, st) => {
   const mapped = loadBankMap()[st.iban];
   if(mapped && accounts.some(a=>a.number===mapped)) return mapped;
+  let last = ""; try { last = localStorage.getItem(LAST_BANK_KEY)||""; } catch {}
+  const lastAcc = accounts.find(a=>a.number===last);
+  if(lastAcc && (lastAcc.currency||CHF)===st.currency) return last;
   const liquid = accounts.filter(a=>a.category==="aktiven" && a.number.startsWith("10") && (a.currency||CHF)===st.currency)
                          .sort((a,b)=>a.number.localeCompare(b.number));
   return (st.currency===CHF && liquid.find(a=>a.number==="1020")?.number) || liquid[0]?.number || "";
@@ -2606,7 +2611,7 @@ Regeln:
     } catch(err){ setError(err.message); }
   };
 
-  const changeBankAcc = (acc) => { setBankAcc(acc); setRows(prev=>applyHistory(prev, acc)); };
+  const changeBankAcc = (acc) => { setBankAcc(acc); saveLastBank(acc); setRows(prev=>applyHistory(prev, acc)); };
   const resetStatement = () => { setStmt(null); setRows([]); setError(""); setStProgress(""); };
 
   const analyseStatement = async () => {
@@ -2727,7 +2732,7 @@ Antworte NUR mit JSON, genau ein Eintrag pro Transaktion, "nr" wie oben:
       newEntries.sort((a,b)=>a.date.localeCompare(b.date)).forEach(e=>{
         e.reference = nextReference(entries, e.date, given); given.push(e.reference);
       });
-      setEntries(p=>[...p, ...newEntries]); saveBankMap(stmt?.iban, bankAcc);
+      setEntries(p=>[...p, ...newEntries]); saveBankMap(stmt?.iban, bankAcc); saveLastBank(bankAcc);
     }
     setRows(next);
   };

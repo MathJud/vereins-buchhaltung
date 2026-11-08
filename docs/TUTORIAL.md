@@ -306,6 +306,7 @@ Hinweise:
    «x Sammelbuchungen aufgeteilt» / «x bereits importiert» / «x aus Verlauf zugeordnet».
 4. **Bankkonto im Kontenplan** wählen. Die Software schlägt eines vor (gleiche Währung, Konten `10xx`,
    bei CHF bevorzugt `1020`) und merkt sich die Zuordnung IBAN → Konto für die nächsten Importe.
+   Ohne bekannte IBAN wird das zuletzt gewählte Bankkonto vorgeschlagen (sofern die Währung passt).
    Zur Auswahl stehen Aktiv- und Passivkonten – z. B. für eine Kreditkarte oder einen
    Kontokorrentkredit, der als Verbindlichkeit geführt wird.
 5. **🔍 Gegenkonten für N vorschlagen** klicken. Das Modell erhält *nur* Gegenpartei, Text, Richtung
