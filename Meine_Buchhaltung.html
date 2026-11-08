@@ -2890,8 +2890,12 @@ Antworte NUR mit JSON, genau ein Eintrag pro Transaktion, "nr" wie oben:
             <Field label="Bankkonto im Kontenplan" style={{flex:"0 1 260px"}}>
               <select value={bankAcc} onChange={e=>changeBankAcc(e.target.value)} style={{...IS,fontSize:13}}>
                 <option value="">— wählen —</option>
-                {accounts.filter(a=>a.category==="aktiven").sort((a,b)=>a.number.localeCompare(b.number)).map(a=>(
-                  <option key={a.number} value={a.number}>{a.number} – {a.name}{a.currency&&a.currency!==CHF?` [${a.currency}]`:""}</option>
+                {[["aktiven","Aktiven"],["passiven","Passiven"]].map(([cat,label])=>(
+                  <optgroup key={cat} label={label}>
+                    {accounts.filter(a=>a.category===cat).sort((a,b)=>a.number.localeCompare(b.number)).map(a=>(
+                      <option key={a.number} value={a.number}>{a.number} – {a.name}{a.currency&&a.currency!==CHF?` [${a.currency}]`:""}</option>
+                    ))}
+                  </optgroup>
                 ))}
               </select>
             </Field>
