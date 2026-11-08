@@ -1226,11 +1226,65 @@ const buildLedger = (acc, entries) => {
   };
 };
 
-function LedgerTable({ ledger, accounts }) {
+// Inline-Bearbeitung einer Buchung im Kontoblatt (volle Tabellenbreite)
+function LedgerEditRow({ accounts, edit, cols }) {
+  const { value, set, save, cancel, del, err } = edit;
+  const [confirm, setConfirm] = useState(false);
+  const sIS = { ...IS, padding:"5px 8px", fontSize:13, borderColor:"#F59E0B" };
+  const keys = ev => { if(ev.key==="Enter") save(); if(ev.key==="Escape") cancel(); };
+  return (
+    <tr style={{background:"#FEFCE8",outline:"2px solid #F59E0B",outlineOffset:"-2px"}}>
+      <td colSpan={cols} style={{padding:"10px 12px"}}>
+        <div style={{display:"grid",gridTemplateColumns:"140px 110px minmax(180px,1fr) 1fr 1fr 120px",gap:8,alignItems:"end"}}>
+          <Field label="Datum">
+            <input type="date" value={value.date} onChange={ev=>set("date",ev.target.value)} style={sIS}/>
+          </Field>
+          <Field label="Belegnr.">
+            <input type="text" value={value.reference||""} onChange={ev=>set("reference",ev.target.value)}
+              onKeyDown={keys} placeholder="—" style={sIS}/>
+          </Field>
+          <Field label="Buchungstext">
+            <input type="text" value={value.description} onChange={ev=>set("description",ev.target.value)}
+              onKeyDown={keys} autoFocus style={sIS}/>
+          </Field>
+          <Field label="Soll">
+            <AccountSelect accounts={accounts} value={value.debit} onChange={v=>set("debit",v)}/>
+          </Field>
+          <Field label="Haben">
+            <AccountSelect accounts={accounts} value={value.credit} onChange={v=>set("credit",v)}/>
+          </Field>
+          <Field label="Betrag CHF">
+            <input type="number" step="0.05" value={value.amount} onChange={ev=>set("amount",ev.target.value)}
+              onKeyDown={keys} style={{...sIS,fontFamily:"'JetBrains Mono',monospace",textAlign:"right"}}/>
+          </Field>
+        </div>
+        <FxInputs accounts={accounts} value={value} onChange={set}/>
+        <div style={{display:"flex",gap:6,marginTop:10,alignItems:"center",justifyContent:"flex-end",flexWrap:"wrap"}}>
+          {err&&<span style={{fontSize:12,color:"#DC2626",marginRight:"auto"}}>{err}</span>}
+          {!confirm
+            ? <button onClick={()=>setConfirm(true)}
+                style={{...SB,padding:"5px 12px",fontSize:12,borderColor:"#FECACA",color:"#EF4444"}}
+                title="Buchung löschen">🗑 Löschen</button>
+            : <>
+                <span style={{fontSize:12,color:"#DC2626",fontWeight:600}}>Buchung wirklich löschen?</span>
+                <button onClick={del} style={{...PB,padding:"5px 10px",fontSize:12,background:"#DC2626"}}>Ja</button>
+                <button onClick={()=>setConfirm(false)} style={{...SB,padding:"5px 10px",fontSize:12}}>Nein</button>
+              </>}
+          <button onClick={cancel} style={{...SB,padding:"5px 12px",fontSize:12}} title="Abbrechen (Esc)">✕ Abbrechen</button>
+          <button onClick={save} style={{...PB,padding:"5px 12px",fontSize:12,background:"#16A34A"}}
+            title="Speichern (Enter)">✓ Speichern</button>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function LedgerTable({ ledger, accounts, edit }) {
   const { account, rows, totSoll, totHaben, saldo, fxSaldo } = ledger;
   const cur  = account.currency||CHF;
   const isFx = cur!==CHF;
-  const cols = isFx ? 10 : 7;
+  const cols = (isFx ? 10 : 7) + (edit ? 1 : 0);
+  const isEd = r => edit?.value && edit.value.id===r.id && edit.value.ledgerAcc===account.number;
   const mono = "'JetBrains Mono',monospace";
   const footTd = {padding:"10px 12px",textAlign:"right",fontFamily:mono,fontWeight:700,borderTop:"2px solid #E2E8F0"};
   return (
@@ -1247,6 +1301,7 @@ function LedgerTable({ ledger, accounts }) {
           <Th align="right" style={{color:"#059669"}}>Haben CHF</Th>
           {isFx&&<Th align="right" style={{color:"#C2410C"}}>Saldo {cur}</Th>}
           <Th align="right">Saldo CHF</Th>
+          {edit&&<Th className="no-print"/>}
         </tr>
       </thead>
       <tbody>
@@ -1256,6 +1311,7 @@ function LedgerTable({ ledger, accounts }) {
           </td></tr>
         ) : rows.map(r=>{
           const cAcc = accounts.find(a=>a.number===r.counter);
+          if(isEd(r)) return <LedgerEditRow key={r.id} accounts={accounts} edit={edit} cols={cols}/>;
           return (
             <tr key={r.id} className="hover-row">
               <Td style={{fontFamily:mono,fontSize:12,color:"#475569"}}>{r.date}</Td>
@@ -1291,6 +1347,16 @@ function LedgerTable({ ledger, accounts }) {
                 style={{fontFamily:mono,fontWeight:600,color:r.saldo>=0?"#0F172A":"#DC2626"}}>
                 {fmt(r.saldo)}
               </Td>
+              {edit&&(
+                <Td className="no-print" align="right">
+                  <button onClick={()=>edit.start(r,account.number)}
+                    style={{background:"none",border:"none",color:"#CBD5E1",cursor:"pointer",
+                            fontSize:14,lineHeight:1,transition:"color .15s",padding:"2px 4px"}}
+                    onMouseEnter={ev=>ev.currentTarget.style.color="#F59E0B"}
+                    onMouseLeave={ev=>ev.currentTarget.style.color="#CBD5E1"}
+                    title="Buchung bearbeiten">✏</button>
+                </Td>
+              )}
             </tr>
           );
         })}
@@ -1304,6 +1370,7 @@ function LedgerTable({ ledger, accounts }) {
             <td style={{...footTd,color:"#059669"}}>{fmt(totHaben)}</td>
             {isFx&&<td style={{...footTd,color:"#C2410C"}}>{fmt(fxSaldo)}</td>}
             <td style={{...footTd,fontSize:14,color:saldo>=0?"#0F172A":"#DC2626"}}>{fmt(saldo)}</td>
+            {edit&&<td className="no-print" style={{borderTop:"2px solid #E2E8F0"}}/>}
           </tr>
         </tfoot>
       )}
@@ -1311,9 +1378,32 @@ function LedgerTable({ ledger, accounts }) {
   );
 }
 
-function HauptbuchTab({ accounts, entries, year }) {
+function HauptbuchTab({ accounts, entries, setEntries, year }) {
   const [selAcc, setSelAcc] = useState("");
   const [filterY, setFilterY] = useState(true);
+  const [editing, setEditing] = useState(null); // Buchung + ledgerAcc (Konto, in dessen Blatt bearbeitet wird)
+  const [editErr, setEditErr] = useState("");
+
+  const cancelEdit = () => { setEditing(null); setEditErr(""); };
+  const edit = {
+    value: editing, err: editErr, cancel: cancelEdit,
+    start: (r, ledgerAcc) => {
+      const e = entries.find(x=>x.id===r.id);
+      if(!e) return;
+      setEditErr("");
+      setEditing({ ...e, ledgerAcc, amount:String(e.amount),
+        fxAmount: e.fxAmount ? String(e.fxAmount) : "", fxRate: e.fxRate ? String(e.fxRate) : "",
+        fxReval: !!e.fxReval });
+    },
+    set: (k,v) => setEditing(p=>fxFormUpdate(p,k,v)),
+    save: () => {
+      const { entry, error } = normalizeEntry(editing, accounts);
+      if(error){ setEditErr(error); return; }
+      setEntries(p=>p.map(e=>e.id===editing.id?entry:e));
+      cancelEdit();
+    },
+    del: () => { setEntries(p=>p.filter(e=>e.id!==editing.id)); cancelEdit(); },
+  };
 
   const account = accounts.find(a=>a.number===selAcc);
   const isDebitNormal = account&&(account.category==="aktiven"||account.category==="aufwand");
@@ -1392,7 +1482,7 @@ function HauptbuchTab({ accounts, entries, year }) {
       {selAcc ? (
         <div style={{background:"white",borderRadius:10,border:"1px solid #E2E8F0",
                      overflow:"auto",boxShadow:"0 1px 3px rgba(0,0,0,.05)"}}>
-          {ledger && <LedgerTable ledger={ledger} accounts={accounts}/>}
+          {ledger && <LedgerTable ledger={ledger} accounts={accounts} edit={edit}/>}
         </div>
       ) : (
         <div>
@@ -1423,7 +1513,7 @@ function HauptbuchTab({ accounts, entries, year }) {
               </div>
               <div style={{background:"white",borderRadius:"0 0 10px 10px",border:"1px solid #E2E8F0",
                            borderTop:"none",overflow:"auto",boxShadow:"0 1px 3px rgba(0,0,0,.05)"}}>
-                <LedgerTable ledger={g} accounts={accounts}/>
+                <LedgerTable ledger={g} accounts={accounts} edit={edit}/>
               </div>
             </div>
           ))}
@@ -3388,7 +3478,8 @@ function App() {
         {tab==="kontenplan" && <KontenplanTab  accounts={accounts} setAccounts={setAccounts}
                                                entries={entries}   getSaldo={getSaldo}
                                                getFxSaldo={getFxSaldo} year={year}/>}
-        {tab==="hauptbuch"  && <HauptbuchTab   accounts={accounts} entries={entries}         year={year}/>}
+        {tab==="hauptbuch"  && <HauptbuchTab   accounts={accounts} entries={entries}
+                                               setEntries={setEntries} year={year}/>}
         {tab==="bilanz"     && <BilanzTab       accounts={accounts} getSaldo={getSaldo}
                                                getFxSaldo={getFxSaldo} fxRates={fxRates}    year={year}
                                                settings={settings}/>}
