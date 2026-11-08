@@ -288,7 +288,7 @@ const normalizeEntry = (raw, accounts) => {
   const base = { id:raw.id, date:raw.date, description:raw.description, reference:raw.reference||"",
                  debit:raw.debit, credit:raw.credit, amount:amt };
   // Herkunft aus dem Kontoauszug-Import (Duplikaterkennung, Lernen der Gegenkonten)
-  for(const k of ["importId","bankCp","bankIban"]) if(raw[k]) base[k] = raw[k];
+  for(const k of ["importId","bankCp","bankIban","bankKey"]) if(raw[k]) base[k] = raw[k];
   if(!currency) return { entry:base };
   if(raw.fxReval) return { entry:{ ...base, fxCurrency:currency, fxAmount:0, fxReval:true } };
   const fx = round2(parseNum(raw.fxAmount));
@@ -2334,11 +2334,51 @@ const decodeBankFile = (buf) => {
 const parseStatement = (text) => text.trimStart().startsWith("<") ? parseCamt(text) : parseBankCsv(text);
 
 // ── Lernen aus früheren Buchungen ───────────────────────────────
-// Importierte Buchungen tragen bankCp/bankIban. Gleiche Gegenpartei + gleiche Richtung
+// Importierte Buchungen tragen bankCp/bankIban/bankKey. Gleiche Gegenpartei + gleiche Richtung
 // → bisheriges Gegenkonto. Eindeutige Fälle werden ohne KI zugeordnet.
-const cpKey = s => String(s||"").toLowerCase().replace(/[^a-z0-9äöüàéè]+/g," ").trim();
-const histKeys = (dirSign, iban, cp) =>
-  [iban && `${dirSign}|iban:${iban}`, cpKey(cp) && `${dirSign}|cp:${cpKey(cp)}`].filter(Boolean);
+// bankKey = bereinigter Zahlungszweck (Ustrd): unterscheidet z. B. bei PayPal, wo Gegenpartei
+// und IBAN immer gleich sind, die eigentlichen Händler.
+const cpKey = s => String(s||"").toLowerCase().replace(/[^a-z0-9äöüàéèç]+/g," ").trim();
+const TXT_STOP = new Set(("ihr ihre einkauf bei zahlung an von für fuer payment to from purchase at the and und der die das "+
+  "abbuchung lastschrift gutschrift überweisung ueberweisung sepa auftrag ref referenz mitteilung abo").split(" "));
+const txtKey = (text, cp) => {
+  const own = new Set(cpKey(cp).split(" "));
+  const words = String(text||"").toLowerCase().split(/\s+/)
+    .filter(t=>!/\d/.test(t))                               // IDs, Daten, «PP.1234.PP» …
+    .flatMap(t=>t.split(/[^a-z0-9äöüàéèç]+/))
+    .filter(t=>t.length>1 && !TXT_STOP.has(t) && !own.has(t));
+  return [...new Set(words)].slice(0,3).join(" ");
+};
+// Vom spezifischsten zum allgemeinsten Schlüssel
+const histKeys = (dirSign, iban, cp, key) => {
+  const c = cpKey(cp);
+  return [key && c    && `${dirSign}|cp:${c}|txt:${key}`,
+          key && iban && `${dirSign}|iban:${iban}|txt:${key}`,
+          iban && `${dirSign}|iban:${iban}`,
+          c    && `${dirSign}|cp:${c}`].filter(Boolean);
+};
+// Zahlungsdienstleister & Co.: Gegenpartei sagt nichts über den Zweck → Händler aus dem Text nehmen.
+// Erkannt über bekannte Namen oder daran, dass die Gegenpartei bisher auf mehrere Konten ging.
+const PASS_THROUGH = /paypal|stripe|sumup|twint|klarna|adyen|mollie|payrexx|datatrans|wallee|amazon pay/i;
+const isPassThrough = (hist, tx) => PASS_THROUGH.test(tx.counterparty||"") ||
+  histKeys(tx.amount>0?"+":"-", tx.iban, tx.counterparty).some(k=>Object.keys(hist.get(k)||{}).length>=2);
+// Lesbarer Händlername aus dem Zahlungszweck, z. B.
+// «1043 PP.8273.PP . Spotify AB, Ihr Einkauf bei Spotify AB» → «Spotify AB»
+const merchantName = (text, cp) => {
+  const own = new Set(cpKey(cp).split(" "));
+  const ustrd = String(text||"").split(" · ")[0];
+  const clean = ustrd.split(/\s+/).filter(t=>!/\d/.test(t)).join(" ");
+  for(const seg of clean.split(/[,;]|\s[.\-–|/]\s/)){
+    const words = seg.split(/\s+/).map(w=>w.replace(/^[^\p{L}]+|[^\p{L}.)]+$/gu,""))
+      .filter(w=>w && !own.has(cpKey(w)));                                      // «PAYPAL *NETFLIX» → «NETFLIX»
+    while(words.length && TXT_STOP.has(words[0].toLowerCase())) words.shift();   // «Ihr Einkauf bei …»
+    if(words.length) return words.join(" ").slice(0,40);
+  }
+  return "";
+};
+
+// Eindeutig = häufigstes Konto ≥2× und ≥80 %
+const histUnique = h => { const total = h.reduce((s,[,n])=>s+n,0); return !!h[0] && h[0][1]>=2 && h[0][1]/total>=0.8; };
 
 const buildBankHistory = (entries, bankAcc) => {
   const m = new Map();
@@ -2347,19 +2387,24 @@ const buildBankHistory = (entries, bankAcc) => {
     const inc = e.debit===bankAcc;
     const other = inc ? e.credit : e.credit===bankAcc ? e.debit : null;
     if(!other) continue;
-    for(const k of histKeys(inc?"+":"-", e.bankIban, e.bankCp)){
+    for(const k of histKeys(inc?"+":"-", e.bankIban, e.bankCp, e.bankKey)){
       const c = m.get(k) || {}; c[other] = (c[other]||0)+1; m.set(k,c);
     }
   }
   return m;
 };
-// → [[konto, anzahl], …] absteigend
+// → [[konto, anzahl], …] absteigend: der spezifischste eindeutige Schlüssel,
+//   sonst der spezifischste vorhandene (nur als Hinweis für die KI)
 const historyFor = (hist, tx) => {
-  for(const k of histKeys(tx.amount>0?"+":"-", tx.iban, tx.counterparty)){
+  let first = null;
+  for(const k of histKeys(tx.amount>0?"+":"-", tx.iban, tx.counterparty, tx.bankKey)){
     const c = hist.get(k);
-    if(c) return Object.entries(c).sort((a,b)=>b[1]-a[1]);
+    if(!c) continue;
+    const h = Object.entries(c).sort((a,b)=>b[1]-a[1]);
+    if(histUnique(h)) return h;
+    first ||= h;
   }
-  return [];
+  return first || [];
 };
 
 const BANK_MAP_KEY = "werckmeister_bank_map";   // IBAN → Kontonummer (nur Komfort, pro Browser)
@@ -2491,17 +2536,19 @@ Regeln:
 
   // ── Kontoauszug handlers ────────────────────────────────────
   // Datum, Betrag und Bankkonto kommen aus der Datei bzw. der Auswahl – die KI wählt nur das Gegenkonto.
-  const defaultText = r => (r.counterparty || r.text || "Bankbuchung").slice(0,60);
+  const defaultText = r => (r.merchant
+    ? (r.counterparty ? `${r.counterparty.split(/\s+/)[0]}: ${r.merchant}` : r.merchant)
+    : (r.counterparty || r.text || "Bankbuchung")).slice(0,60);
 
   // Eindeutige frühere Zuordnungen (≥2×, ≥80 %) direkt übernehmen
   const applyHistory = (list, acc) => {
     const hist = buildBankHistory(entries, acc);
     return list.map(r=>{
+      r = { ...r, merchant: isPassThrough(hist, r) ? merchantName(r.bankText, r.counterparty) : "" };
       if(r.booked || r.dup || r.source==="ki" || r.source==="manuell") return r;
       const h = historyFor(hist, r);
-      const total = h.reduce((s,[,n])=>s+n,0);
       const [konto, n] = h[0] || [];
-      if(konto && konto!==acc && n>=2 && n/total>=0.8 && accounts.some(a=>a.number===konto))
+      if(histUnique(h) && konto!==acc && accounts.some(a=>a.number===konto))
         return { ...r, konto, text: r.text || defaultText(r),
                  why:`Bisher ${n}× auf ${konto} gebucht`, source:"verlauf" };
       return r.source==="verlauf" ? { ...r, konto:"", why:"", source:"" } : r;
@@ -2519,7 +2566,7 @@ Regeln:
       setStmt({ format:st.format, iban:st.iban, currency:st.currency, info:st.info, fileName:f.name });
       setBankAcc(acc);
       setRate(st.currency!==CHF ? String(fxRates?.[year]?.[st.currency]||"") : "");
-      setRows(applyHistory(st.txs.map(t=>({ ...t, bankText:t.text, konto:"", text:"", why:"", source:"",
+      setRows(applyHistory(st.txs.map(t=>({ ...t, bankText:t.text, bankKey:txtKey(t.text, t.counterparty), konto:"", text:"", why:"", source:"",
         dup:done.has(t.key), selected:!done.has(t.key), booked:done.has(t.key), error:"" })), acc));
     } catch(err){ setError(err.message); }
   };
@@ -2626,7 +2673,7 @@ Antworte NUR mit JSON, genau ein Eintrag pro Transaktion, "nr" wie oben:
     const inc = r.amount>0;
     return normalizeEntry({ date:r.date, description:r.text || defaultText(r), reference:"",
       debit: inc ? bankAcc : r.konto, credit: inc ? r.konto : bankAcc, amount, fxAmount,
-      importId:r.key, bankCp:r.counterparty, bankIban:r.iban }, accounts);
+      importId:r.key, bankCp:r.counterparty, bankIban:r.iban, bankKey:r.bankKey }, accounts);
   };
 
   const bookStatement = () => {
