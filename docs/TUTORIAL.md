@@ -30,7 +30,7 @@ Zwei Vorlagen werden mitgeliefert (JSON-Dateien im Ordner `kontenplaene/`):
 | Vorlage                                   | Datei                      | Jahresergebnis | Kursgewinne / -verluste |
 |-------------------------------------------|----------------------------|----------------|-------------------------|
 | Schweizer Vereins-Kontenrahmen (Standard) | `kontenplaene/verein.json` | 2900           | 3450 / 6700             |
-| Schweizer KMU-Kontenrahmen                | `kontenplaene/kmu.json`    | 2979           | 6952 / 6942             |
+| Schweizer KMU-Kontenrahmen                | `kontenplaene/kmu.json`    | 2979           | 6992 / 6942             |
 
 1. Tab **⚙️ Einstellungen → Kontenplan-Vorlage**.
 2. Vorlage wählen → **Vorlage übernehmen** → bestätigen.
@@ -193,6 +193,8 @@ EUR → USD wird in zwei Buchungen über ein CHF-Konto erfasst.
    - **Kursverluste** sind immer angehakt (Vorsichtsprinzip, nicht abwählbar).
    - **Kursgewinne** sind nur bei flüssigen Mitteln (Konten `10xx`) angehakt; bei Debitoren/Kreditoren
      sind sie als «unrealisiert – Imparitätsprinzip» markiert und standardmässig nicht gebucht.
+   - **Eigenkapitalkonten** (Gruppe «Eigenkapital…», z. B. Privat EUR) werden nicht bewertet und unter
+     der Tabelle als «Nicht bewertet (Eigenkapital)» aufgeführt.
 4. Gegenkonten prüfen (Standard `3450` / `6700`; fehlen sie, mit **Anlegen** erzeugen).
 5. **Bewertungsbuchungen erstellen** → Buchungen per 31.12. mit Beleg `FW-BEW-<Jahr>`.
 

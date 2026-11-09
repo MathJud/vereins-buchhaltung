@@ -315,9 +315,14 @@ const nextReference = (entries, date, extra=[]) => {
 //  – Gewinne standardmässig nur auf flüssigen Mitteln / kurzfristigen Wertschriften
 //    (Konten 10xx, beobachtbarer Marktpreis OR 960b); auf Forderungen und
 //    Verbindlichkeiten bleiben unrealisierte Gewinne unberücksichtigt (Imparitätsprinzip)
+//  – Eigenkapitalkonten (Gruppe «Eigenkapital…», z. B. Privat EUR) werden nicht bewertet:
+//    Eigenkapital ist eine Restgrösse, keine Forderung oder Schuld in Fremdwährung
+const isEquityAccount = (a) => a.category==="passiven" && /^\s*eigenkapital/i.test(a.group||"");
+const fxAccountsOf = (accounts) =>
+  accounts.filter(a=>(a.currency||CHF)!==CHF && (a.category==="aktiven"||a.category==="passiven"));
 const computeFxValuation = ({ accounts, getSaldo, getFxSaldo, rates, year }) =>
-  accounts
-    .filter(a=>(a.currency||CHF)!==CHF && (a.category==="aktiven"||a.category==="passiven"))
+  fxAccountsOf(accounts)
+    .filter(a=>!isEquityAccount(a))
     .slice().sort((a,b)=>a.number.localeCompare(b.number))
     .map(a=>{
       const fxSaldo = getFxSaldo(a.number,year);
@@ -1959,6 +1964,7 @@ function FremdwaehrungTab({ accounts, setAccounts, setEntries, getSaldo, getFxSa
   const setRate = (cur, v) => setFxRates(p=>({ ...p, [year]: { ...(p?.[year]||{}), [cur]: v } }));
 
   const rows = computeFxValuation({ accounts, getSaldo, getFxSaldo, rates, year });
+  const equityFx = fxAccountsOf(accounts).filter(isEquityAccount).sort((a,b)=>a.number.localeCompare(b.number));
   const isChecked = (r) => override[r.account.number] ?? r.defaultBook;
   const toBook = rows.filter(r=>r.diff && isChecked(r));
 
@@ -1980,13 +1986,19 @@ function FremdwaehrungTab({ accounts, setAccounts, setEntries, getSaldo, getFxSa
   };
 
   const mono = "'JetBrains Mono',monospace";
-  const incomeAccs  = accounts.filter(a=>a.category==="ertrag");
-  const expenseAccs = accounts.filter(a=>a.category==="aufwand");
-  const shortSel = (list, value, onChange) => (
+  // Alle Erfolgskonten wählbar: im KMU-Kontenrahmen liegen Kursgewinne z.B. auf 6992
+  // (Klasse 6, Finanzertrag), die bevorzugte Kategorie wird zuerst angezeigt.
+  const accsOf = cat => accounts.filter(a=>a.category===cat).sort((a,b)=>a.number.localeCompare(b.number));
+  const CAT_LABEL = { ertrag:"Ertragskonten", aufwand:"Aufwandkonten" };
+  const shortSel = (cats, value, onChange) => (
     <select value={value} onChange={e=>onChange(e.target.value)} style={IS}>
       <option value="">Konto wählen…</option>
-      {list.slice().sort((a,b)=>a.number.localeCompare(b.number)).map(a=>(
-        <option key={a.number} value={a.number}>{a.number} – {a.name}</option>
+      {cats.map(cat=>(
+        <optgroup key={cat} label={CAT_LABEL[cat]}>
+          {accsOf(cat).map(a=>(
+            <option key={a.number} value={a.number}>{a.number} – {a.name}</option>
+          ))}
+        </optgroup>
       ))}
     </select>
   );
@@ -2085,8 +2097,8 @@ function FremdwaehrungTab({ accounts, setAccounts, setEntries, getSaldo, getFxSa
         </div>
 
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr auto",gap:10,alignItems:"end",marginTop:14}}>
-          <Field label="Gegenkonto Kursgewinne">{shortSel(incomeAccs, gainAcc, setGainAcc)}</Field>
-          <Field label="Gegenkonto Kursverluste">{shortSel(expenseAccs, lossAcc, setLossAcc)}</Field>
+          <Field label="Gegenkonto Kursgewinne">{shortSel(["ertrag","aufwand"], gainAcc, setGainAcc)}</Field>
+          <Field label="Gegenkonto Kursverluste">{shortSel(["aufwand","ertrag"], lossAcc, setLossAcc)}</Field>
           <button onClick={book} disabled={toBook.length===0}
             style={{...PB,height:38,opacity:toBook.length?1:.45,cursor:toBook.length?"pointer":"default"}}>
             {toBook.length ? `${toBook.length} Bewertungsbuchung${toBook.length===1?"":"en"} erstellen` : "Nichts zu buchen"}
@@ -2100,6 +2112,12 @@ function FremdwaehrungTab({ accounts, setAccounts, setEntries, getSaldo, getFxSa
         )}
         {err&&<div style={{marginTop:10,padding:"6px 10px",background:"#FEF2F2",borderRadius:5,color:"#DC2626",fontSize:12}}>⚠ {err}</div>}
         {msg&&<div style={{marginTop:10,padding:"6px 10px",background:"#F0FDF4",borderRadius:5,color:"#15803D",fontSize:12}}>{msg}</div>}
+        {equityFx.length>0&&(
+          <div style={{marginTop:10,fontSize:11.5,color:MUTED,lineHeight:1.5}}>
+            Nicht bewertet (Eigenkapital): {equityFx.map(a=>`${a.number} ${a.name}`).join(", ")}.
+            Eigenkapital bleibt zum historischen Kurs stehen.
+          </div>
+        )}
         <div style={{marginTop:10,fontSize:11.5,color:MUTED,lineHeight:1.5}}>
           Die Bewertung bezieht sich auf die Buchungen des Geschäftsjahres {year} (inkl. Eröffnungsbuchungen).
           Bei nachträglich geändertem Kurs einfach erneut buchen – es wird nur die verbleibende Differenz erfasst.
@@ -2127,6 +2145,8 @@ const FxRulesInfo = () => (
         Imparitätsprinzip standardmässig nicht erfasst.</li>
       <li><strong>Eröffnung im Folgejahr</strong>: Fremdwährungskonten mit dem Betrag in Fremdwährung und dem
         Stichtagskurs des Vorjahres eröffnen, damit FW- und CHF-Saldo übereinstimmen.</li>
+      <li><strong>Eigenkapital</strong> (Konten der Gruppe «Eigenkapital…», z. B. Privat EUR) wird nicht bewertet:
+        Es ist eine Restgrösse und keine Forderung oder Schuld in Fremdwährung. Es bleibt zum historischen Kurs stehen.</li>
     </ul>
   </Card>
 );

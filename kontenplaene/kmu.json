@@ -5,7 +5,7 @@
   "description": "Vereinfachter Kontenrahmen für Schweizer KMU, angelehnt an den Kontenrahmen KMU (Kontenklassen 1–8, Gliederung nach OR 959a/959b).",
   "resultAccount": "2979",
   "fxAccounts": {
-    "gain": "6952",
+    "gain": "6992",
     "loss": "6942"
   },
   "accounts": [
@@ -101,7 +101,7 @@
     {"number": "6940", "name": "Bankspesen und Gebühren", "category": "aufwand", "group": "Finanzaufwand"},
     {"number": "6942", "name": "Kursverluste (Fremdwährungen)", "category": "aufwand", "group": "Finanzaufwand"},
     {"number": "6950", "name": "Zins- und Wertschriftenertrag", "category": "ertrag", "group": "Finanzertrag"},
-    {"number": "6952", "name": "Kursgewinne (Fremdwährungen)", "category": "ertrag", "group": "Finanzertrag"},
+    {"number": "6992", "name": "Kursgewinne (Fremdwährungen)", "category": "ertrag", "group": "Finanzertrag"},
 
     {"number": "7000", "name": "Ertrag Nebenbetrieb", "category": "ertrag", "group": "Betrieblicher Nebenerfolg"},
     {"number": "7010", "name": "Aufwand Nebenbetrieb", "category": "aufwand", "group": "Betrieblicher Nebenerfolg"},
