@@ -491,6 +491,13 @@ const Badge = ({ cat }) => {
                          fontSize:11, fontWeight:600 }}>{labels[cat]||cat}</span>;
 };
 
+// Tauscht Soll- und Haben-Konto einer Buchung
+const SwapAccountsButton = ({ onClick, height=34 }) => (
+  <button type="button" onClick={onClick} title="Soll und Haben vertauschen"
+    style={{ ...SB, padding:"0 8px", height, fontSize:15, lineHeight:1, flexShrink:0 }}>⇄</button>
+);
+const swapAccounts = p => ({ ...p, debit:p.credit, credit:p.debit });
+
 const AccountSelect = ({ accounts, value, onChange, placeholder="Konto wählen…" }) => (
   <select value={value} onChange={e => onChange(e.target.value)} style={IS}>
     <option value="">{placeholder}</option>
@@ -730,10 +737,11 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
               style={{...IS,fontFamily:"'JetBrains Mono',monospace",textAlign:"right"}} />
           </Field>
         </div>
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr auto", gap:10, marginTop:10, alignItems:"end" }}>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr auto 1fr auto", gap:10, marginTop:10, alignItems:"end" }}>
           <Field label="Soll (Debit) *">
             <AccountSelect accounts={accounts} value={form.debit} onChange={v=>f("debit",v)} />
           </Field>
+          <SwapAccountsButton onClick={()=>setForm(swapAccounts)} height={38}/>
           <Field label="Haben (Kredit) *">
             <AccountSelect accounts={accounts} value={form.credit} onChange={v=>f("credit",v)} />
           </Field>
@@ -801,7 +809,12 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
                                        boxShadow:"0 0 0 3px rgba(245,158,11,.15)"}}/>
                   </Td>
                   <Td>
-                    <AccountSelect accounts={accounts} value={editing.debit} onChange={v=>ef("debit",v)}/>
+                    <div style={{display:"flex",gap:4,alignItems:"center"}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <AccountSelect accounts={accounts} value={editing.debit} onChange={v=>ef("debit",v)}/>
+                      </div>
+                      <SwapAccountsButton onClick={()=>setEditing(swapAccounts)}/>
+                    </div>
                   </Td>
                   <Td>
                     <AccountSelect accounts={accounts} value={editing.credit} onChange={v=>ef("credit",v)}/>
@@ -1233,14 +1246,14 @@ const buildLedger = (acc, entries) => {
 
 // Inline-Bearbeitung einer Buchung im Kontoblatt (volle Tabellenbreite)
 function LedgerEditRow({ accounts, edit, cols }) {
-  const { value, set, save, cancel, del, err } = edit;
+  const { value, set, swap, save, cancel, del, err } = edit;
   const [confirm, setConfirm] = useState(false);
   const sIS = { ...IS, padding:"5px 8px", fontSize:13, borderColor:"#F59E0B" };
   const keys = ev => { if(ev.key==="Enter") save(); if(ev.key==="Escape") cancel(); };
   return (
     <tr style={{background:"#FEFCE8",outline:"2px solid #F59E0B",outlineOffset:"-2px"}}>
       <td colSpan={cols} style={{padding:"10px 12px"}}>
-        <div style={{display:"grid",gridTemplateColumns:"140px 110px minmax(180px,1fr) 1fr 1fr 120px",gap:8,alignItems:"end"}}>
+        <div style={{display:"grid",gridTemplateColumns:"140px 110px minmax(180px,1fr) 1fr auto 1fr 120px",gap:8,alignItems:"end"}}>
           <Field label="Datum">
             <input type="date" value={value.date} onChange={ev=>set("date",ev.target.value)} style={sIS}/>
           </Field>
@@ -1255,6 +1268,7 @@ function LedgerEditRow({ accounts, edit, cols }) {
           <Field label="Soll">
             <AccountSelect accounts={accounts} value={value.debit} onChange={v=>set("debit",v)}/>
           </Field>
+          <SwapAccountsButton onClick={swap}/>
           <Field label="Haben">
             <AccountSelect accounts={accounts} value={value.credit} onChange={v=>set("credit",v)}/>
           </Field>
@@ -1401,6 +1415,7 @@ function HauptbuchTab({ accounts, entries, setEntries, year }) {
         fxReval: !!e.fxReval });
     },
     set: (k,v) => setEditing(p=>fxFormUpdate(p,k,v)),
+    swap: () => setEditing(swapAccounts),
     save: () => {
       const { entry, error } = normalizeEntry(editing, accounts);
       if(error){ setEditErr(error); return; }
