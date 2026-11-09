@@ -604,6 +604,11 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
   const [sort,    setSort]    = useState({ key:"date", dir:"desc" });
   const [editing, setEditing] = useState(null); // {id, date, description, reference, debit, credit, amount}
   const [editErr, setEditErr] = useState("");
+  const blankFilter = { date:"", reference:"", description:"", debit:"", credit:"", amount:"" };
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [colFilter,  setColFilter]  = useState(blankFilter);
+  const filterActive = Object.values(colFilter).some(v=>v.trim());
+  const toggleSearch = () => { if(searchOpen) setColFilter(blankFilter); setSearchOpen(o=>!o); };
 
   const f = (k,v) => setForm(p=>fxFormUpdate(p,k,v));
 
@@ -620,7 +625,33 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
   const ef = (k,v) => setEditing(p=>fxFormUpdate(p,k,v));
 
   const visible = useMemo(()=>{
-    const arr = filterY ? entries.filter(e=>e.date.startsWith(String(year))) : [...entries];
+    let arr = filterY ? entries.filter(e=>e.date.startsWith(String(year))) : [...entries];
+    // Spaltenfilter (Suche): Text = enthält, Gross-/Kleinschreibung egal
+    const norm = s => String(s||"").toLowerCase();
+    const has  = (hay, q) => norm(hay).includes(norm(q).trim());
+    const accLabel = n => `${n} ${accounts.find(a=>a.number===n)?.name||""}`;
+    const dateCH = d => { const [y,m,dd] = String(d).split("-"); return `${dd}.${m}.${y}`; };
+    // Betrag: «>100», «<=50», «=20» oder «100-200» als Vergleich, sonst Textsuche
+    const amountMatch = (amt, q) => {
+      const s = q.trim().replace(/\s/g,""); if(!s) return true;
+      const a = Number(amt);
+      const range = s.match(/^([\d.,']+)-([\d.,']+)$/);
+      if(range) return a>=parseNum(range[1]) && a<=parseNum(range[2]);
+      const op = s.match(/^(>=|<=|>|<|=)(.+)$/);
+      if(op){
+        const n = parseNum(op[2]); if(isNaN(n)) return true;
+        return { ">=":a>=n, "<=":a<=n, ">":a>n, "<":a<n, "=":Math.abs(a-n)<0.005 }[op[1]];
+      }
+      return a.toFixed(2).includes(s.replace(",",".")) || has(fmt(a), s);
+    };
+    const F = colFilter;
+    if(Object.values(F).some(v=>v.trim())) arr = arr.filter(e =>
+      (!F.date.trim()        || has(e.date,F.date) || has(dateCH(e.date),F.date)) &&
+      (!F.reference.trim()   || has(e.reference,F.reference)) &&
+      (!F.description.trim() || has(e.description,F.description)) &&
+      (!F.debit.trim()       || has(accLabel(e.debit),F.debit)) &&
+      (!F.credit.trim()      || has(accLabel(e.credit),F.credit)) &&
+      amountMatch(e.amount, F.amount));
     const txt = (x,y) => String(x||"").localeCompare(String(y||""),"de",{numeric:true,sensitivity:"base"});
     const cmp = {
       date:        (a,b) => a.date.localeCompare(b.date),
@@ -633,7 +664,7 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
     const sign = sort.dir==="desc" ? -1 : 1;
     // Bei Gleichstand nach Datum, dann Erfassungsreihenfolge
     return arr.sort((a,b)=> sign*(cmp(a,b) || a.date.localeCompare(b.date) || a.id-b.id));
-  },[entries,year,filterY,sort]);
+  },[entries,year,filterY,sort,colFilter,accounts]);
 
   const toggleSort = (key) => setSort(p => p.key===key
     ? { key, dir: p.dir==="asc" ? "desc" : "asc" }
@@ -775,6 +806,30 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
                    overflow:"auto",boxShadow:"0 1px 3px rgba(0,0,0,.05)"}}>
         <table style={{width:"100%",borderCollapse:"collapse"}}>
           <thead>
+            {searchOpen && (
+              <tr className="no-print">
+                {[["date","Datum / TT.MM.JJJJ"],["reference","Belegnr."],["description","Buchungstext"],
+                  ["debit","Nr. oder Name"],["credit","Nr. oder Name"],["amount","z. B. >100, 50-200"]]
+                  .map(([k,ph],i)=>(
+                  <th key={k} style={{padding:"6px 6px 4px",background:"#F1F5F9",borderBottom:"1px solid #E2E8F0"}}>
+                    <input type="text" value={colFilter[k]} placeholder={ph}
+                      autoFocus={i===2}
+                      onChange={ev=>setColFilter(p=>({...p,[k]:ev.target.value}))}
+                      onKeyDown={ev=>{ if(ev.key==="Escape") setColFilter(p=>({...p,[k]:""})); }}
+                      style={{...IS,padding:"4px 7px",fontSize:12,fontWeight:400,
+                              ...(k==="amount"?{textAlign:"right",fontFamily:"'JetBrains Mono',monospace"}:{}),
+                              ...(colFilter[k].trim()?{borderColor:"#0F2460",background:"#EFF6FF"}:{})}}/>
+                  </th>
+                ))}
+                <th style={{padding:"6px 6px 4px",background:"#F1F5F9",borderBottom:"1px solid #E2E8F0",
+                            textAlign:"right"}}>
+                  <button onClick={()=>setColFilter(blankFilter)} disabled={!filterActive}
+                    title="Alle Filter zurücksetzen"
+                    style={{...SB,padding:"4px 8px",fontSize:12,opacity:filterActive?1:.4,
+                            cursor:filterActive?"pointer":"default"}}>✕</button>
+                </th>
+              </tr>
+            )}
             <tr>
               <SortTh k="date">Datum</SortTh>
               <SortTh k="reference">Belegnr.</SortTh>
@@ -782,13 +837,21 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
               <SortTh k="debit">Soll</SortTh>
               <SortTh k="credit">Haben</SortTh>
               <SortTh k="amount" align="right">Betrag CHF</SortTh>
-              <Th className="no-print"/>
+              <Th className="no-print" align="right">
+                <button onClick={toggleSearch}
+                  title={searchOpen ? "Suche schliessen (Filter zurücksetzen)" : "Buchungen suchen / filtern"}
+                  style={{background:searchOpen||filterActive?"#E0E7FF":"none",border:"none",borderRadius:5,
+                          cursor:"pointer",fontSize:13,lineHeight:1,padding:"3px 6px",
+                          color:searchOpen?"#0F2460":"#64748B"}}>🔍</button>
+              </Th>
             </tr>
           </thead>
           <tbody>
             {visible.length===0 ? (
               <tr><td colSpan={7} style={{padding:36,textAlign:"center",color:MUTED,fontStyle:"italic"}}>
-                Noch keine Buchungen — erfasse deine erste Buchung oben.
+                {filterActive
+                  ? "Keine Buchungen entsprechen dem Filter."
+                  : "Noch keine Buchungen — erfasse deine erste Buchung oben."}
               </td></tr>
             ) : visible.map(e=>{
               const isEditing = editing?.id===e.id;
@@ -899,7 +962,7 @@ function JournalTab({ accounts, setAccounts, entries, setEntries, fxRates, setFx
               <tr style={{background:"#F8FAFC"}}>
                 <td colSpan={5} style={{padding:"10px 12px",fontWeight:700,fontSize:13,
                                         borderTop:"2px solid #E2E8F0"}}>
-                  Total {filterY?year:"alle"} ({visible.length} Buchungen)
+                  Total {filterY?year:"alle"}{filterActive?", gefiltert":""} ({visible.length} Buchungen)
                 </td>
                 <td style={{padding:"10px 12px",textAlign:"right",
                              fontFamily:"'JetBrains Mono',monospace",fontWeight:700,fontSize:14,
